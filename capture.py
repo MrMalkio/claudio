@@ -337,6 +337,18 @@ def main():
     mixer = Mixer(pid)
     limiter = Limiter()
 
+    stopping = threading.Lock()
+
+    def stop():
+        """Put the app's volume back, then exit. Runs once, from whichever thread
+        notices first that Claudio is gone (stdin closed or stdout broken)."""
+        stopping.acquire()
+        try:
+            mixer.restore()
+        finally:
+            import os
+            os._exit(0)
+
     def watch_stdin():
         try:
             for line in sys.stdin.buffer:
@@ -344,11 +356,16 @@ def main():
                 if cmd[:1] == ["quiet"]:
                     mixer.quiet(cmd[1:2] == ["1"])
         finally:
-            mixer.restore()
-            import os
-            os._exit(0)
+            stop()
 
     threading.Thread(target=watch_stdin, daemon=True).start()
+    try:
+        record(cap, mixer, limiter, pid)
+    finally:
+        stop()
+
+
+def record(cap, mixer, limiter, pid):
     print(f"capturing pid {pid} at {RATE} Hz", file=sys.stderr, flush=True)
     out = sys.stdout.buffer
     data, frames, flags = c_void_p(), c_uint32(), c_uint32()

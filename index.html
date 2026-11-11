@@ -63,7 +63,7 @@
     <span class="dot" id="dot"></span><b>Claudio</b>
     <span id="status">Starting…</span>
     <span id="ctitle">No clip selected</span>
-    <button class="icon toggle" id="listen" title="Listen in Claudio: Claude and ChatGPT play silently in the background and you hear them here. Pausing here doesn't stop the recording.">🎧</button>
+    <button class="icon toggle" id="listen" title="Listen in Claudio: Claude and Codex play silently in the background and you hear them here. Pausing here doesn't stop the recording.">🎧</button>
     <button class="icon" id="mode" title="Compact view">▭</button>
     <button class="icon" id="hide" title="Hide to tray">–</button>
   </div>
@@ -219,7 +219,7 @@ function ago(t) {
 }
 function renderList() {
   const L = $('list'); L.innerHTML = '';
-  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude or ChatGPT, or “Read latest reply” above.</div>'; return; }
+  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude or Codex, or “Read latest reply” above.</div>'; return; }
   for (const m of clipsMeta) {
     const d = document.createElement('div');
     d.className = 'clip' + (m.id === selId ? ' sel' : '');

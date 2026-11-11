@@ -13,12 +13,12 @@ const END_SILENCE_MS = 3000; // silence that ends a clip
 const MIN_SOUND_MS = 800; // shorter clips (chimes, clicks) are discarded
 
 // Apps Claudio listens to. Each is matched by process name and install folder, and
-// recorded on its own. ChatGPT hides its page from UI Automation, so it is record-only.
+// recorded on its own. Codex hides its page from UI Automation, so it is record-only.
 const APPS = [
   { name: 'Claude', exe: 'claude.exe', path: '*\\WindowsApps\\Claude_*' },
-  // The ChatGPT desktop app (installed as OpenAI.Codex, older installs as OpenAI.ChatGPT).
+  // The Codex desktop app (ChatGPT.exe; installed as OpenAI.Codex, older installs as OpenAI.ChatGPT).
   // Its notification chime is 1.4 s long.
-  { name: 'ChatGPT', exe: 'ChatGPT.exe', path: '*\\WindowsApps\\OpenAI.*', minSoundMs: 2500 },
+  { name: 'Codex', exe: 'ChatGPT.exe', path: '*\\WindowsApps\\OpenAI.*', minSoundMs: 2500 },
 ];
 const FULL_SIZE = { width: 380, height: 560 };
 const COMPACT_SIZE = { width: 380, height: 132 };
@@ -55,7 +55,7 @@ function loadIndex() {
   // Older clips were saved as <id>.wav; give them readable names once.
   let changed = false;
   for (const m of list) {
-    if (m.app === 'Codex') { m.app = 'ChatGPT'; changed = true; } // same app, one name
+    if (m.app === 'ChatGPT') { m.app = 'Codex'; changed = true; } // briefly labelled ChatGPT
     if (m.file === `${m.id}.wav`) {
       const name = renameClipFile(m.file, clipFileName(m.title, m.startedAt));
       if (name !== m.file) { m.file = name; changed = true; }
@@ -93,7 +93,7 @@ function send(ch, data) { if (win && !win.isDestroyed()) win.webContents.send(ch
 function status(text) { send('status', text); }
 function showListening() {
   const on = sources.filter((s) => s.state === 'on').map((s) => s.name);
-  status(on.length ? `Listening to ${on.join(' and ')}` : 'Waiting for Claude or ChatGPT to start…');
+  status(on.length ? `Listening to ${on.join(' and ')}` : 'Waiting for Claude or Codex to start…');
 }
 function liveClips() { return sources.filter((s) => s.cur).map((s) => s.cur); }
 
@@ -114,7 +114,10 @@ async function startCapture(src) {
   const pid = await findPid(src);
   if (!pid) { src.state = 'waiting'; showListening(); setTimeout(() => startCapture(src), 5000); return; }
   src.pid = pid;
-  src.capture = spawn('python', ['-I', path.join(__dirname, 'capture.py'), String(pid)], { windowsHide: true });
+  // detached: Node otherwise puts children in a job that Windows kills with Claudio,
+  // and capture.py must outlive a crash long enough to put the app's volume back.
+  // It still exits on its own when Claudio's end of stdin closes.
+  src.capture = spawn('python', ['-I', path.join(__dirname, 'capture.py'), String(pid)], { windowsHide: true, detached: true });
   src.capture.stdout.on('data', (chunk) => onPcm(src, chunk));
   src.capture.stderr.on('data', (d) => console.log(`[capture ${src.name}]`, String(d).trim()));
   src.capture.stdin.on('error', () => {});
@@ -364,8 +367,16 @@ app.whenReady().then(() => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
   app.isQuitting = true;
-  for (const src of sources) { finishClip(src); if (src.capture) src.capture.stdin.end(); }
+  const running = sources.filter((s) => s.capture);
+  for (const src of sources) finishClip(src);
+  if (!running.length) return;
+  // Let each capture put its app's volume back before Claudio goes.
+  e.preventDefault();
+  let left = running.length;
+  const done = () => { if (--left === 0) app.exit(0); };
+  for (const src of running) { src.capture.once('exit', done); src.capture.stdin.end(); src.capture = null; }
+  setTimeout(() => app.exit(0), 3000);
 });
 app.on('window-all-closed', (e) => e.preventDefault());
