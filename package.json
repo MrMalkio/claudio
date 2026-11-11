@@ -1,6 +1,6 @@
 {
   "name": "claudio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Records Claude's Read aloud audio so you can scrub, save and share it.",
   "main": "main.js",
   "private": true,
