@@ -44,16 +44,31 @@
   .clip .acts { display: none; gap: 4px; } .clip:hover .acts, .clip.sel .acts { display: flex; }
   .clip .acts button { padding: 2px 6px; font-size: 12px; }
   .empty { color: var(--muted); padding: 16px 10px; text-align: center; }
+  button.toggle.on { background: #2b3a6b; border-color: var(--accent); }
+  #ctitle { display: none; font-weight: 600; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Compact: just the player, with the session name in the title bar. */
+  body.compact #claudeSec, body.compact #list, body.compact #title, body.compact #save,
+  body.compact .bar b, body.compact #status { display: none; }
+  body.compact #ctitle { display: block; }
+  body.compact #player { border-bottom: 0; padding: 6px 10px 8px; }
+  body.compact canvas { height: 34px; }
+  body.compact .times { display: none; }
+  body.compact .controls { justify-content: space-between; align-items: center; margin-top: 6px; }
+  body.compact .controls .ct { display: inline; }
+  .controls .ct { display: none; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 40px; }
 </style>
 </head>
 <body>
   <div class="bar">
     <span class="dot" id="dot"></span><b>Claudio</b>
     <span id="status">Starting…</span>
+    <span id="ctitle">No clip selected</span>
+    <button class="icon toggle" id="listen" title="Listen in Claudio: Claude and ChatGPT play silently in the background and you hear them here. Pausing here doesn't stop the recording.">🎧</button>
+    <button class="icon" id="mode" title="Compact view">▭</button>
     <button class="icon" id="hide" title="Hide to tray">–</button>
   </div>
 
-  <section>
+  <section id="claudeSec">
     <div class="label">Claude</div>
     <div class="row">
       <select id="windows" title="Claude window to read from"><option value="">Any Claude window</option></select>
@@ -65,16 +80,18 @@
     </div>
   </section>
 
-  <section>
+  <section id="player">
     <div id="title">No clip selected</div>
     <canvas id="wave" width="680" height="128"></canvas>
     <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
     <div class="controls">
+      <span class="ct" id="cpos">0:00</span>
       <button id="back" title="Back 10 s (←)">-10</button>
       <button id="play" class="primary" title="Play / pause (space)">Play</button>
       <button id="fwd" title="Forward 10 s (→)">+10</button>
       <button id="tolive" title="Jump to the newest audio">Live</button>
       <button id="save" title="Save a copy as WAV">Save</button>
+      <span class="ct" id="cdur" style="text-align:right">0:00</span>
     </div>
   </section>
 
@@ -108,7 +125,17 @@ function toInt16(u8) {
 // ---------- player ----------
 let ctx = null, node = null;
 let selId = null, pos = 0, playing = false, followLive = false;
+// Listen in Claudio: the apps play silently and new clips play here automatically,
+// unless you paused partway through one (then it stays where you left it).
+let listen = false, userPaused = false;
 function sel() { return selId ? store.get(selId) : null; }
+function setTitle(t) { $('title').textContent = t; $('ctitle').textContent = t; $('ctitle').title = t; }
+function togglePlay() {
+  const c = sel();
+  userPaused = playing && !!c && (c.live || pos < c.len);
+  if (!playing) userPaused = false;
+  setPlaying(!playing);
+}
 function ensureAudio() {
   if (ctx) return;
   ctx = new AudioContext({ sampleRate: RATE });
@@ -121,7 +148,7 @@ function ensureAudio() {
     out.set(c.data.subarray(pos, pos + n));
     out.fill(0, n);
     pos += n;
-    if (pos >= c.len && !c.live) { playing = false; pos = c.len; }
+    if (pos >= c.len && !c.live) { playing = false; userPaused = false; pos = c.len; }
   };
   node.connect(ctx.destination);
 }
@@ -143,7 +170,7 @@ async function select(id) {
     c = ensure(id, false);
     if (u8) { c.len = 0; append(c, toInt16(u8)); c.loaded = true; }
   }
-  $('title').textContent = (meta && meta.title) || c.title || 'Recording…';
+  setTitle((meta && meta.title) || c.title || 'Recording…');
   renderList(); draw();
 }
 
@@ -153,7 +180,7 @@ function fmt(s) { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:
 function draw() {
   const W = cv.width, H = cv.height, c = sel();
   g.clearRect(0, 0, W, H);
-  if (!c || !c.len) { $('pos').textContent = '0:00'; $('dur').textContent = '0:00'; $('play').textContent = 'Play'; return; }
+  if (!c || !c.len) { for (const id of ['pos', 'dur', 'cpos', 'cdur']) $(id).textContent = '0:00'; $('play').textContent = 'Play'; return; }
   const total = c.live ? Math.max(c.len, RATE * 20) : c.len; // live clips leave room to grow
   const per = total / W, played = pos / per;
   for (let x = 0; x < W; x++) {
@@ -167,6 +194,8 @@ function draw() {
   g.fillStyle = '#e8e8ee'; g.fillRect(Math.min(W - 2, played), 0, 2, H);
   $('pos').textContent = fmt(pos / RATE);
   $('dur').innerHTML = c.live ? `<span class="live">● REC</span> ${fmt(c.len / RATE)}` : fmt(c.len / RATE);
+  $('cpos').textContent = fmt(pos / RATE);
+  $('cdur').innerHTML = c.live ? `<span class="live">●</span> ${fmt(c.len / RATE)}` : fmt(c.len / RATE);
   $('play').textContent = playing ? 'Pause' : 'Play';
 }
 let dragging = false;
@@ -190,7 +219,7 @@ function ago(t) {
 }
 function renderList() {
   const L = $('list'); L.innerHTML = '';
-  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude or Codex, or “Read latest reply” above.</div>'; return; }
+  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude or ChatGPT, or “Read latest reply” above.</div>'; return; }
   for (const m of clipsMeta) {
     const d = document.createElement('div');
     d.className = 'clip' + (m.id === selId ? ' sel' : '');
@@ -203,13 +232,13 @@ function renderList() {
       if (a === 'rename') {
         const n = d.querySelector('.n'); n.contentEditable = 'true'; n.focus();
         document.getSelection().selectAllChildren(n);
-        const done = () => { n.contentEditable = 'false'; const t = n.textContent.trim(); if (t && t !== m.title) { m.title = t; api.renameClip(m.id, t); if (m.id === selId) $('title').textContent = t; } renderList(); };
+        const done = () => { n.contentEditable = 'false'; const t = n.textContent.trim(); if (t && t !== m.title) { m.title = t; api.renameClip(m.id, t); if (m.id === selId) setTitle(t); } renderList(); };
         n.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') { ev.preventDefault(); n.blur(); } if (ev.key === 'Escape') { n.textContent = m.title; n.blur(); } };
         n.onblur = done; return;
       }
       if (e.target.isContentEditable) return;
       if (a === 'reveal') { api.revealClip(m.id); return; }
-      if (a === 'del') { if (confirm('Delete this recording?')) { api.deleteClip(m.id); clipsMeta = clipsMeta.filter((x) => x.id !== m.id); if (selId === m.id) { selId = null; $('title').textContent = 'No clip selected'; draw(); } renderList(); } return; }
+      if (a === 'del') { if (confirm('Delete this recording?')) { api.deleteClip(m.id); clipsMeta = clipsMeta.filter((x) => x.id !== m.id); if (selId === m.id) { selId = null; setTitle('No clip selected'); draw(); } renderList(); } return; }
       select(m.id);
     };
     L.appendChild(d);
@@ -222,12 +251,13 @@ api.on('clip-start', (m) => {
   const c = ensure(m.id, true); c.title = m.title;
   clipsMeta.unshift({ ...m, duration: 0 });
   $('dot').className = 'dot rec';
-  if (!playing) { selId = null; select(m.id); }
+  if (listen && !userPaused) { selId = null; select(m.id).then(() => { if (selId === m.id) setPlaying(true); }); }
+  else if (!playing) { selId = null; select(m.id); }
   renderList();
 });
 api.on('clip-title', ({ id, title }) => {
   const m = clipsMeta.find((x) => x.id === id); if (m) m.title = title;
-  if (id === selId) $('title').textContent = title; renderList();
+  if (id === selId) setTitle(title); renderList();
 });
 api.on('clip-data', ({ id, pcm }) => {
   const c = ensure(id, true); append(c, toInt16(pcm));
@@ -241,12 +271,21 @@ api.on('clip-end', (meta) => {
 });
 api.on('clip-discard', ({ id }) => {
   store.delete(id); clipsMeta = clipsMeta.filter((x) => x.id !== id);
-  if (selId === id) { selId = null; playing = false; $('title').textContent = 'No clip selected'; draw(); }
+  if (selId === id) { selId = null; playing = false; setTitle('No clip selected'); draw(); }
   $('dot').className = 'dot on'; renderList();
 });
 
 // ---------- buttons ----------
-$('play').onclick = () => setPlaying(!playing);
+$('play').onclick = togglePlay;
+function showSettings(s) {
+  listen = s.listen;
+  $('listen').classList.toggle('on', listen);
+  document.body.classList.toggle('compact', s.compact);
+  $('mode').textContent = s.compact ? '▢' : '▭';
+  $('mode').title = s.compact ? 'Full view' : 'Compact view';
+}
+$('listen').onclick = async () => showSettings(await api.setListen(!listen));
+$('mode').onclick = async () => showSettings(await api.setCompact(!document.body.classList.contains('compact')));
 $('back').onclick = () => { followLive = false; seek(pos - 10 * RATE); };
 $('fwd').onclick = () => { followLive = false; seek(pos + 10 * RATE); };
 $('tolive').onclick = () => { const c = sel(); if (c) { seek(c.len - RATE / 2); if (!playing) setPlaying(true); } };
@@ -254,7 +293,7 @@ $('save').onclick = () => selId && !sel()?.live && api.saveClip(selId);
 $('hide').onclick = () => api.hide();
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT') return;
-  if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
   if (e.code === 'ArrowLeft') seek(pos - 5 * RATE);
   if (e.code === 'ArrowRight') seek(pos + 5 * RATE);
 });
@@ -282,6 +321,7 @@ async function refreshWindows() {
 $('refresh').onclick = refreshWindows;
 
 (async () => {
+  showSettings(await api.settings());
   const { clips, live } = await api.clips();
   clipsMeta = clips.slice();
   for (const l of live || []) { ensure(l.id, true); clipsMeta.unshift({ ...l, duration: 0 }); }
