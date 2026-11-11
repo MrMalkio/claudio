@@ -1,8 +1,8 @@
 # Claudio
 
-A small always-on-top window (plus a tray icon) that records what Claude desktop
-says out loud, so Read aloud replies become clips you can scrub, rewind, skip
-and save.
+A small always-on-top window (plus a tray icon) that records what the Claude
+and Codex desktop apps say out loud, so Read aloud replies become clips you can
+scrub, rewind, skip and save.
 
 Windows 11 only (it uses process loopback capture, added in Windows 11). Needs [Node.js](https://nodejs.org) and
 [Python 3](https://www.python.org) (no extra Python packages).
@@ -24,10 +24,21 @@ Tray icon: click to show or hide; right-click for the clips folder and Quit.
 
 ## What it does (MVP)
 
-- **Records Claude only.** Captures the Claude app's own audio (Windows process
-  loopback), not the whole system. Claude still plays to your normal speakers
-  exactly as before; if Claudio is closed, nothing changes.
-- **Splits into clips.** A clip starts when Claude makes sound and ends after
+- **Records Claude and Codex, nothing else.** Captures each app's own audio
+  (Windows process loopback), not the whole system. Each app is recorded
+  separately, and each clip in the list shows which app it came from. The apps
+  still play to your normal speakers exactly as before; if Claudio is closed,
+  nothing changes.
+  - **Claude desktop:** recording, naming and the play/pause controls below.
+  - **Codex desktop** (ChatGPT conversations inside Codex have Read aloud):
+    recording only. Press Read aloud in Codex yourself; the clip is named
+    "Codex audio" plus the time, and you can rename it. Codex hides its page
+    from Windows' accessibility tools, so Claudio can't press its buttons or
+    read the thread name. Codex clips need 2.5 s of sound, so its 1.4 s
+    notification chime is ignored.
+  - **ChatGPT desktop:** set up the same way as Codex, but untested (it wasn't
+    installed on the PC this was built on).
+- **Splits into clips.** A clip starts when the app makes sound and ends after
   3 s of quiet. Anything under 0.8 s of sound (chimes, clicks) is thrown away.
   Clips are named after the thread (session) that was reading plus the start of
   the reply (up to 60 characters), and the file is saved as
@@ -47,8 +58,8 @@ Tray icon: click to show or hide; right-click for the clips folder and Quit.
 
 | Piece | Job |
 | --- | --- |
-| `capture.py` | Python + ctypes, calls `ActivateAudioInterfaceAsync` with `VAD\Process_Loopback` for Claude's main process and its children, and streams 48 kHz mono PCM to stdout. |
-| `main.js` | Electron main: finds Claude, runs the capture, cuts clips, writes WAVs, tray and window. |
+| `capture.py` | Python + ctypes, calls `ActivateAudioInterfaceAsync` with `VAD\Process_Loopback` for one app's main process and its children, and streams 48 kHz mono PCM to stdout. |
+| `main.js` | Electron main: finds each app (the `APPS` list), runs one capture per app, cuts clips, writes WAVs, tray and window. |
 | `index.html` | The window: player, waveform and clip list. Plays clips through Web Audio. |
 | `claude-control.ps1` | UI Automation: finds and presses Claude's Read aloud / Pause / Resume buttons. |
 
@@ -100,9 +111,9 @@ MVP records from the outside instead.
   accessibility tree, the name falls back to the reply's last visible block of
   text, so it can be a mid-reply line.
 - Share: today it is Save as WAV. Next: MP3/Opus export and a share link.
-- Only the Claude desktop app is supported. Codex and ChatGPT desktop are not
-  yet: `capture.py` takes any process id, so adding them is mostly picking the
-  right process and button names.
+- Codex is record-only (see above). Its replies also have no pause, only
+  Stop and Replay.
+- Codex voice chat and other Codex sounds longer than 2.5 s become clips too.
 - Untested: whether muting Claude in the Windows volume mixer also mutes the
   recording.
 - Speed control (1.25x, 1.5x) is not in yet.

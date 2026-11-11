@@ -190,12 +190,12 @@ function ago(t) {
 }
 function renderList() {
   const L = $('list'); L.innerHTML = '';
-  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude, or “Read latest reply” above.</div>'; return; }
+  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude or Codex, or “Read latest reply” above.</div>'; return; }
   for (const m of clipsMeta) {
     const d = document.createElement('div');
     d.className = 'clip' + (m.id === selId ? ' sel' : '');
     const live = store.get(m.id)?.live;
-    d.innerHTML = `<div class="t"><div class="n"></div><div class="m">${live ? '<span class="live">● recording</span>' : `${ago(m.startedAt)} · ${fmt(m.duration)}`}</div></div>
+    d.innerHTML = `<div class="t"><div class="n"></div><div class="m">${m.app || 'Claude'} · ${live ? '<span class="live">● recording</span>' : `${ago(m.startedAt)} · ${fmt(m.duration)}`}</div></div>
       <div class="acts">${live ? '' : '<button data-a="rename" title="Rename">✎</button><button data-a="reveal" title="Show file">📁</button><button data-a="del" title="Delete">🗑</button>'}</div>`;
     d.querySelector('.n').textContent = m.title;
     d.onclick = (e) => {
@@ -284,7 +284,7 @@ $('refresh').onclick = refreshWindows;
 (async () => {
   const { clips, live } = await api.clips();
   clipsMeta = clips.slice();
-  if (live) { ensure(live.id, true); clipsMeta.unshift({ ...live, duration: 0 }); }
+  for (const l of live || []) { ensure(l.id, true); clipsMeta.unshift({ ...l, duration: 0 }); }
   renderList(); draw();
   refreshWindows();
 })();

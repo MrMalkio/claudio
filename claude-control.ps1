@@ -63,6 +63,17 @@ function Get-Reply($button) {
       $up = $Walker.GetParent($node)
       if (-not $up -or $up.Current.Name -eq 'Chat messages') { break }
       $node = $up
+      # Sometimes the whole reply, toolbar included, is wrapped in its "Message N" group.
+      if ($up.Current.Name -match '^Message \d+$') {
+        $c = $Walker.GetFirstChild($up)
+        for ($j = 0; $c -and $j -lt 50; $j++) {
+          $n = $c.Current.Name
+          if ($n -match '^Claude responded:\s*(.+)$') { return $Matches[1].Trim() }
+          if ($c.Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and $n.Trim()) { return $n.Trim() }
+          $c = $Walker.GetNextSibling($c)
+        }
+        return ''
+      }
     }
     # Fallback when the label has scrolled out of the tree: the first line after the
     # reply's last unnamed group (usually a tool-call block), else the earliest line seen.
