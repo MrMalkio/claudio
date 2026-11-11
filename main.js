@@ -16,11 +16,12 @@ const MIN_SOUND_MS = 800; // shorter clips (chimes, clicks) are discarded
 // recorded on its own. Codex hides its page from UI Automation, so it is record-only.
 const APPS = [
   { name: 'Claude', exe: 'claude.exe', path: '*\\WindowsApps\\Claude_*' },
-  // Codex's desktop program is called ChatGPT.exe. Its notification chime is 1.4 s long.
-  { name: 'Codex', exe: 'ChatGPT.exe', path: '*\\WindowsApps\\OpenAI.Codex_*', minSoundMs: 2500 },
-  // The standalone ChatGPT desktop app (not installed on the dev PC, so untested).
-  { name: 'ChatGPT', exe: 'ChatGPT.exe', path: '*\\WindowsApps\\OpenAI.ChatGPT*', minSoundMs: 2500 },
+  // The Codex desktop app (ChatGPT.exe; installed as OpenAI.Codex, older installs as OpenAI.ChatGPT).
+  // Its notification chime is 1.4 s long.
+  { name: 'Codex', exe: 'ChatGPT.exe', path: '*\\WindowsApps\\OpenAI.*', minSoundMs: 2500 },
 ];
+const FULL_SIZE = { width: 380, height: 560 };
+const COMPACT_SIZE = { width: 380, height: 132 };
 const KEEP_TAIL_MS = 500;
 const PREROLL_BLOCKS = 10;
 
@@ -30,7 +31,14 @@ app.disableHardwareAcceleration();
 
 const clipsDir = path.join(app.getPath('userData'), 'clips');
 const indexFile = path.join(clipsDir, 'index.json');
+const settingsFile = path.join(app.getPath('userData'), 'settings.json');
 fs.mkdirSync(clipsDir, { recursive: true });
+
+// listen: "Listen in Claudio" (the apps play quietly, Claudio plays the audio).
+// compact: the small window with only the player.
+let settings = { listen: false, compact: false };
+try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsFile, 'utf8')) }; } catch {}
+function saveSettings() { fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2)); }
 
 let win = null;
 let tray = null;
@@ -47,6 +55,7 @@ function loadIndex() {
   // Older clips were saved as <id>.wav; give them readable names once.
   let changed = false;
   for (const m of list) {
+    if (m.app === 'ChatGPT') { m.app = 'Codex'; changed = true; } // briefly labelled ChatGPT
     if (m.file === `${m.id}.wav`) {
       const name = renameClipFile(m.file, clipFileName(m.title, m.startedAt));
       if (name !== m.file) { m.file = name; changed = true; }
@@ -105,9 +114,14 @@ async function startCapture(src) {
   const pid = await findPid(src);
   if (!pid) { src.state = 'waiting'; showListening(); setTimeout(() => startCapture(src), 5000); return; }
   src.pid = pid;
-  src.capture = spawn('python', ['-I', path.join(__dirname, 'capture.py'), String(pid)], { windowsHide: true });
+  // detached: Node otherwise puts children in a job that Windows kills with Claudio,
+  // and capture.py must outlive a crash long enough to put the app's volume back.
+  // It still exits on its own when Claudio's end of stdin closes.
+  src.capture = spawn('python', ['-I', path.join(__dirname, 'capture.py'), String(pid)], { windowsHide: true, detached: true });
   src.capture.stdout.on('data', (chunk) => onPcm(src, chunk));
   src.capture.stderr.on('data', (d) => console.log(`[capture ${src.name}]`, String(d).trim()));
+  src.capture.stdin.on('error', () => {});
+  if (settings.listen) src.capture.stdin.write('quiet 1\n');
   src.capture.on('exit', () => {
     src.capture = null;
     src.state = 'waiting';
@@ -280,6 +294,21 @@ ipcMain.handle('delete-clip', (_e, id) => {
   saveIndex();
 });
 ipcMain.on('hide', () => win && win.hide());
+ipcMain.handle('settings', () => settings);
+ipcMain.handle('set-listen', (_e, on) => {
+  settings.listen = !!on;
+  saveSettings();
+  for (const src of sources) if (src.capture) src.capture.stdin.write(`quiet ${on ? 1 : 0}\n`);
+  return settings;
+});
+ipcMain.handle('set-compact', (_e, on) => {
+  settings.compact = !!on;
+  saveSettings();
+  // Keep the window's bottom edge where it is, so it shrinks toward the corner.
+  const b = win.getBounds(), size = on ? COMPACT_SIZE : FULL_SIZE;
+  win.setBounds({ x: b.x, y: b.y + b.height - size.height, width: b.width, height: size.height });
+  return settings;
+});
 
 // ---------- window + tray ----------
 function trayIcon() {
@@ -300,8 +329,10 @@ function trayIcon() {
 
 function createWindow() {
   const { workArea } = screen.getPrimaryDisplay();
+  const size = settings.compact ? COMPACT_SIZE : FULL_SIZE;
   win = new BrowserWindow({
-    width: 380, height: 560, x: workArea.x + workArea.width - 400, y: workArea.y + workArea.height - 580,
+    ...size, x: workArea.x + workArea.width - size.width - 20, y: workArea.y + workArea.height - size.height - 20,
+    minWidth: 300, minHeight: COMPACT_SIZE.height,
     frame: false, resizable: true, alwaysOnTop: true, skipTaskbar: true, show: false,
     backgroundColor: '#16171d', title: 'Claudio', icon: trayIcon(),
     webPreferences: { preload: path.join(__dirname, 'preload.js') },
@@ -336,8 +367,16 @@ app.whenReady().then(() => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
   app.isQuitting = true;
-  for (const src of sources) { finishClip(src); if (src.capture) src.capture.stdin.end(); }
+  const running = sources.filter((s) => s.capture);
+  for (const src of sources) finishClip(src);
+  if (!running.length) return;
+  // Let each capture put its app's volume back before Claudio goes.
+  e.preventDefault();
+  let left = running.length;
+  const done = () => { if (--left === 0) app.exit(0); };
+  for (const src of running) { src.capture.once('exit', done); src.capture.stdin.end(); src.capture = null; }
+  setTimeout(() => app.exit(0), 3000);
 });
 app.on('window-all-closed', (e) => e.preventDefault());
