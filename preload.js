@@ -15,5 +15,13 @@ contextBridge.exposeInMainWorld('claudio', {
   updateInfo: () => ipcRenderer.invoke('update-info'),
   runUpdate: () => ipcRenderer.invoke('run-update'),
   openRelease: () => ipcRenderer.send('open-release'),
+  checkUpdates: () => ipcRenderer.invoke('check-updates'),
+  setUpdateMode: (mode) => ipcRenderer.invoke('set-update-mode', mode),
+  appInfo: () => ipcRenderer.invoke('app-info'),
+  chooseClipsDir: () => ipcRenderer.invoke('choose-clips-dir'),
+  resetClipsDir: () => ipcRenderer.invoke('reset-clips-dir'),
+  openClipsDir: () => ipcRenderer.send('open-clips-dir'),
+  openMaker: () => ipcRenderer.send('open-maker'),
+  setSession: (id, session) => ipcRenderer.invoke('set-session', id, session),
   on: (channel, fn) => ipcRenderer.on(channel, (_e, data) => fn(data)),
 });

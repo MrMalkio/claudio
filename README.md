@@ -23,14 +23,26 @@ From a terminal you can also run `npm start`.
 
 - On GitHub, click **Watch → Custom → Releases** on this repo. GitHub emails you
   when a new version is released.
-- In Claudio, right-click the tray icon and tick **Notify me of updates**. Claudio
-  then asks GitHub for the latest release once a day (nothing else is sent). When
-  there is a newer one, a bar appears with **Update**, which runs `git pull` and
-  `npm install` in the Claudio folder and restarts. If you downloaded a ZIP
-  instead of cloning, Update opens the release page so you can download it.
+- In Claudio, open **Settings (⚙)** and pick one:
+  - **Don't check for updates** (the default).
+  - **Tell me, and I'll click Update.** Claudio asks GitHub for the latest
+    release when it starts and once a day (nothing else is sent). When there is
+    a newer one, a bar appears with **Update** (a ⬆ button in compact view).
+  - **Update automatically.** Same check, but Claudio updates on its own, once
+    nothing is being recorded.
 
-Clips live in `%APPDATA%\claudio\clips` (WAV, 48 kHz mono, plus `index.json`).
-Tray icon: click to show or hide; right-click for the clips folder and Quit.
+  Updating runs `git pull` and `npm install` in the Claudio folder and
+  restarts Claudio. If you downloaded a ZIP instead of cloning, Update opens the
+  release page so you can download it.
+
+Recordings are kept in `%APPDATA%\claudio\clips` (WAV, 48 kHz mono, plus
+`index.json`). To keep them somewhere else, open **Settings → Recordings
+folder → Change…**; your existing recordings move there too. If the new folder
+already has Claudio recordings (for example a synced folder), the lists merge.
+
+Tray icon: click to show or hide; right-click for the clips folder, Settings and
+Quit. Only one Claudio runs at a time: opening it again shows the window that's
+already open.
 
 ## What it does (MVP)
 
@@ -54,6 +66,16 @@ Tray icon: click to show or hide; right-click for the clips folder and Quit.
   `Website redesign - Launching three background agents for the content work… 2026-11-10 18-43-18.wav`.
   The reply text is Claude's own "Claude responded: …" label for that message.
   Renaming a clip in the list renames its file too (the timestamp stays).
+  If Claude only shows which thread is reading a moment later, Claudio keeps
+  asking for a few seconds and renames the clip when it can.
+- **Grouped by session.** The list puts each clip under its Claude thread, newest
+  first. Click a group's header to fold it. If a clip is in the wrong group (or
+  in "No session"), hover it, click **⇄** and type or pick the session.
+  Codex clips have no thread name, so they start in their own group.
+- **Nothing lost on a crash.** If Claudio stops mid-recording, the next start
+  puts that recording back in the list as "(recovered)", along with any WAV in
+  the folder the list didn't know about. Errors are written to
+  `%APPDATA%\claudio\claudio.log` instead of closing Claudio.
 - **Your own playhead.** Play, pause, -10 / +10, drag on the waveform, or
   Space and the arrow keys, all while Claude keeps playing and the recording
   keeps growing. "Live" jumps to the newest audio.
