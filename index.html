@@ -1,0 +1,293 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+<title>Claudio</title>
+<style>
+  :root {
+    --bg: #16171d; --panel: #1f2029; --line: #2c2e3a; --text: #e8e8ee; --muted: #8b8d9c;
+    --accent: #5777d9; --accent-2: #7d97ea; --rec: #e5484d; --wave: #3a3d4d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  body { display: flex; flex-direction: column; border: 1px solid var(--line); }
+  .bar { -webkit-app-region: drag; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .bar b { font-weight: 600; letter-spacing: .02em; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: #3fb950; } .dot.rec { background: var(--rec); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  #status { color: var(--muted); font-size: 12px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button, select { -webkit-app-region: no-drag; font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  button:hover { border-color: var(--accent); } button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); }
+  .icon { padding: 3px 8px; }
+  section { padding: 10px; border-bottom: 1px solid var(--line); }
+  .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  .row select { flex: 1; min-width: 0; }
+  #title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 6px; }
+  canvas { width: 100%; height: 64px; display: block; background: var(--panel); border-radius: 6px; cursor: pointer; }
+  .times { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 4px 0 8px; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; gap: 6px; justify-content: center; }
+  .controls button { min-width: 44px; }
+  #play { min-width: 64px; }
+  .live { color: var(--rec); font-weight: 600; }
+  #list { flex: 1; overflow-y: auto; padding: 4px 0; }
+  .clip { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; }
+  .clip:hover { background: var(--panel); } .clip.sel { background: #262a3b; }
+  .clip .t { flex: 1; min-width: 0; }
+  .clip .n { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .clip .m { color: var(--muted); font-size: 11px; }
+  .clip .acts { display: none; gap: 4px; } .clip:hover .acts, .clip.sel .acts { display: flex; }
+  .clip .acts button { padding: 2px 6px; font-size: 12px; }
+  .empty { color: var(--muted); padding: 16px 10px; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <span class="dot" id="dot"></span><b>Claudio</b>
+    <span id="status">Starting…</span>
+    <button class="icon" id="hide" title="Hide to tray">–</button>
+  </div>
+
+  <section>
+    <div class="label">Claude</div>
+    <div class="row">
+      <select id="windows" title="Claude window to read from"><option value="">Any Claude window</option></select>
+      <button class="icon" id="refresh" title="Refresh windows">↻</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" id="read" style="flex:1">▶ Read latest reply</button>
+      <button id="ctoggle" title="Pause or resume Claude's own playback">⏯ Claude</button>
+    </div>
+  </section>
+
+  <section>
+    <div id="title">No clip selected</div>
+    <canvas id="wave" width="680" height="128"></canvas>
+    <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
+    <div class="controls">
+      <button id="back" title="Back 10 s (←)">-10</button>
+      <button id="play" class="primary" title="Play / pause (space)">Play</button>
+      <button id="fwd" title="Forward 10 s (→)">+10</button>
+      <button id="tolive" title="Jump to the newest audio">Live</button>
+      <button id="save" title="Save a copy as WAV">Save</button>
+    </div>
+  </section>
+
+  <div id="list"></div>
+
+<script>
+const RATE = 48000;
+const $ = (id) => document.getElementById(id);
+const api = window.claudio;
+
+// ---------- clip store ----------
+const store = new Map(); // id -> { data: Float32Array, len, live, title }
+function ensure(id, live) {
+  let c = store.get(id);
+  if (!c) { c = { data: new Float32Array(RATE * 30), len: 0, live, loaded: live }; store.set(id, c); }
+  return c;
+}
+function append(c, int16) {
+  if (c.len + int16.length > c.data.length) {
+    const bigger = new Float32Array(Math.max(c.data.length * 2, c.len + int16.length));
+    bigger.set(c.data.subarray(0, c.len)); c.data = bigger;
+  }
+  for (let i = 0; i < int16.length; i++) c.data[c.len + i] = int16[i] / 32768;
+  c.len += int16.length;
+}
+function toInt16(u8) {
+  const copy = new Uint8Array(u8.length - (u8.length % 2)); copy.set(u8.subarray(0, copy.length));
+  return new Int16Array(copy.buffer);
+}
+
+// ---------- player ----------
+let ctx = null, node = null;
+let selId = null, pos = 0, playing = false, followLive = false;
+function sel() { return selId ? store.get(selId) : null; }
+function ensureAudio() {
+  if (ctx) return;
+  ctx = new AudioContext({ sampleRate: RATE });
+  node = ctx.createScriptProcessor(2048, 0, 1);
+  node.onaudioprocess = (e) => {
+    const out = e.outputBuffer.getChannelData(0);
+    const c = sel();
+    if (!playing || !c) { out.fill(0); return; }
+    const n = Math.max(0, Math.min(out.length, c.len - pos));
+    out.set(c.data.subarray(pos, pos + n));
+    out.fill(0, n);
+    pos += n;
+    if (pos >= c.len && !c.live) { playing = false; pos = c.len; }
+  };
+  node.connect(ctx.destination);
+}
+function setPlaying(p) {
+  ensureAudio(); ctx.resume();
+  const c = sel(); if (!c) return;
+  if (p && pos >= c.len && !c.live) pos = 0;
+  playing = p; draw();
+}
+function seek(s) { const c = sel(); if (!c) return; pos = Math.max(0, Math.min(c.len, Math.round(s))); draw(); }
+
+async function select(id) {
+  if (selId === id) return;
+  playing = false; selId = id; pos = 0;
+  const meta = clipsMeta.find((m) => m.id === id);
+  let c = store.get(id);
+  if (!c || !c.loaded) {
+    const u8 = await api.clipPcm(id);
+    c = ensure(id, false);
+    if (u8) { c.len = 0; append(c, toInt16(u8)); c.loaded = true; }
+  }
+  $('title').textContent = (meta && meta.title) || c.title || 'Recording…';
+  renderList(); draw();
+}
+
+// ---------- waveform ----------
+const cv = $('wave'), g = cv.getContext('2d');
+function fmt(s) { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; }
+function draw() {
+  const W = cv.width, H = cv.height, c = sel();
+  g.clearRect(0, 0, W, H);
+  if (!c || !c.len) { $('pos').textContent = '0:00'; $('dur').textContent = '0:00'; $('play').textContent = 'Play'; return; }
+  const total = c.live ? Math.max(c.len, RATE * 20) : c.len; // live clips leave room to grow
+  const per = total / W, played = pos / per;
+  for (let x = 0; x < W; x++) {
+    const a = Math.floor(x * per), b = Math.min(c.len, Math.floor((x + 1) * per));
+    if (a >= c.len) break;
+    let peak = 0; for (let i = a; i < b; i += 8) { const v = Math.abs(c.data[i]); if (v > peak) peak = v; }
+    const h = Math.max(1, Math.min(1, peak * 2.2) * (H - 8));
+    g.fillStyle = x < played ? '#7d97ea' : '#3a3d4d';
+    g.fillRect(x, (H - h) / 2, 1, h);
+  }
+  g.fillStyle = '#e8e8ee'; g.fillRect(Math.min(W - 2, played), 0, 2, H);
+  $('pos').textContent = fmt(pos / RATE);
+  $('dur').innerHTML = c.live ? `<span class="live">● REC</span> ${fmt(c.len / RATE)}` : fmt(c.len / RATE);
+  $('play').textContent = playing ? 'Pause' : 'Play';
+}
+let dragging = false;
+function seekFromEvent(e) {
+  const c = sel(); if (!c) return;
+  const r = cv.getBoundingClientRect(), total = c.live ? Math.max(c.len, RATE * 20) : c.len;
+  seek(((e.clientX - r.left) / r.width) * total);
+}
+cv.addEventListener('mousedown', (e) => { dragging = true; seekFromEvent(e); });
+window.addEventListener('mousemove', (e) => dragging && seekFromEvent(e));
+window.addEventListener('mouseup', () => { dragging = false; });
+setInterval(() => { if (playing || (sel() && sel().live)) draw(); }, 100);
+
+// ---------- clip list ----------
+let clipsMeta = [];
+function ago(t) {
+  const m = Math.round((Date.now() - t) / 60000);
+  if (m < 1) return 'just now'; if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60); if (h < 24) return `${h} h ago`;
+  return new Date(t).toLocaleDateString();
+}
+function renderList() {
+  const L = $('list'); L.innerHTML = '';
+  if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude, or “Read latest reply” above.</div>'; return; }
+  for (const m of clipsMeta) {
+    const d = document.createElement('div');
+    d.className = 'clip' + (m.id === selId ? ' sel' : '');
+    const live = store.get(m.id)?.live;
+    d.innerHTML = `<div class="t"><div class="n"></div><div class="m">${live ? '<span class="live">● recording</span>' : `${ago(m.startedAt)} · ${fmt(m.duration)}`}</div></div>
+      <div class="acts">${live ? '' : '<button data-a="rename" title="Rename">✎</button><button data-a="reveal" title="Show file">📁</button><button data-a="del" title="Delete">🗑</button>'}</div>`;
+    d.querySelector('.n').textContent = m.title;
+    d.onclick = (e) => {
+      const a = e.target.dataset?.a;
+      if (a === 'rename') {
+        const n = d.querySelector('.n'); n.contentEditable = 'true'; n.focus();
+        document.getSelection().selectAllChildren(n);
+        const done = () => { n.contentEditable = 'false'; const t = n.textContent.trim(); if (t && t !== m.title) { m.title = t; api.renameClip(m.id, t); if (m.id === selId) $('title').textContent = t; } renderList(); };
+        n.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') { ev.preventDefault(); n.blur(); } if (ev.key === 'Escape') { n.textContent = m.title; n.blur(); } };
+        n.onblur = done; return;
+      }
+      if (e.target.isContentEditable) return;
+      if (a === 'reveal') { api.revealClip(m.id); return; }
+      if (a === 'del') { if (confirm('Delete this recording?')) { api.deleteClip(m.id); clipsMeta = clipsMeta.filter((x) => x.id !== m.id); if (selId === m.id) { selId = null; $('title').textContent = 'No clip selected'; draw(); } renderList(); } return; }
+      select(m.id);
+    };
+    L.appendChild(d);
+  }
+}
+
+// ---------- events from main ----------
+api.on('status', (t) => { $('status').textContent = t; $('dot').className = 'dot' + (/Listening/.test(t) ? ' on' : ''); });
+api.on('clip-start', (m) => {
+  const c = ensure(m.id, true); c.title = m.title;
+  clipsMeta.unshift({ ...m, duration: 0 });
+  $('dot').className = 'dot rec';
+  if (!playing) { selId = null; select(m.id); }
+  renderList();
+});
+api.on('clip-title', ({ id, title }) => {
+  const m = clipsMeta.find((x) => x.id === id); if (m) m.title = title;
+  if (id === selId) $('title').textContent = title; renderList();
+});
+api.on('clip-data', ({ id, pcm }) => {
+  const c = ensure(id, true); append(c, toInt16(pcm));
+  if (followLive && id === selId) pos = Math.max(pos, c.len - RATE / 2);
+});
+api.on('clip-end', (meta) => {
+  const c = store.get(meta.id); if (c) { c.live = false; c.loaded = true; }
+  const i = clipsMeta.findIndex((x) => x.id === meta.id);
+  if (i >= 0) clipsMeta[i] = meta; else clipsMeta.unshift(meta);
+  $('dot').className = 'dot on'; renderList(); draw();
+});
+api.on('clip-discard', ({ id }) => {
+  store.delete(id); clipsMeta = clipsMeta.filter((x) => x.id !== id);
+  if (selId === id) { selId = null; playing = false; $('title').textContent = 'No clip selected'; draw(); }
+  $('dot').className = 'dot on'; renderList();
+});
+
+// ---------- buttons ----------
+$('play').onclick = () => setPlaying(!playing);
+$('back').onclick = () => { followLive = false; seek(pos - 10 * RATE); };
+$('fwd').onclick = () => { followLive = false; seek(pos + 10 * RATE); };
+$('tolive').onclick = () => { const c = sel(); if (c) { seek(c.len - RATE / 2); if (!playing) setPlaying(true); } };
+$('save').onclick = () => selId && !sel()?.live && api.saveClip(selId);
+$('hide').onclick = () => api.hide();
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  if (e.code === 'ArrowLeft') seek(pos - 5 * RATE);
+  if (e.code === 'ArrowRight') seek(pos + 5 * RATE);
+});
+
+async function claude(action) {
+  const w = $('windows').value || undefined;
+  $('status').textContent = action === 'read' ? 'Asking Claude to read…' : 'Talking to Claude…';
+  const r = await api.claude(action, w);
+  $('status').textContent = r.ok ? (r.window ? `Claude: ${r.did || action} in “${r.window}”` : 'Listening to Claude') : r.error;
+}
+$('read').onclick = () => claude('read');
+$('ctoggle').onclick = () => claude('toggle');
+async function refreshWindows() {
+  $('status').textContent = 'Looking for Claude windows…';
+  const r = await api.claude('windows');
+  const s = $('windows'), keep = s.value;
+  s.innerHTML = '<option value="">Any Claude window</option>';
+  for (const w of (r.windows || [])) {
+    const o = document.createElement('option'); o.value = w.title;
+    o.textContent = `${w.title}${w.state !== 'idle' ? ` (${w.state})` : ''}`; s.appendChild(o);
+  }
+  s.value = keep;
+  $('status').textContent = r.ok ? `${(r.windows || []).length} Claude window(s) with replies` : r.error;
+}
+$('refresh').onclick = refreshWindows;
+
+(async () => {
+  const { clips, live } = await api.clips();
+  clipsMeta = clips.slice();
+  if (live) { ensure(live.id, true); clipsMeta.unshift({ ...live, duration: 0 }); }
+  renderList(); draw();
+  refreshWindows();
+})();
+</script>
+</body>
+</html>
