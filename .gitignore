@@ -1,3 +1,4 @@
 node_modules/
 *.wav
 *.log
+__pycache__/

@@ -1,6 +1,6 @@
 {
   "name": "claudio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Records Claude's Read aloud audio so you can scrub, save and share it.",
   "main": "main.js",
   "private": true,
@@ -9,5 +9,6 @@
   },
   "devDependencies": {
     "electron": "43.4.0"
-  }
+  },
+  "license": "MIT"
 }

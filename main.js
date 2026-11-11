@@ -1,6 +1,6 @@
-// Claudio: records Claude desktop's audio (Read aloud) into clips you can scrub,
-// save and share. Capture runs in capture.py (WASAPI process loopback);
-// Claude's buttons are driven by claude-control.ps1 (UI Automation).
+// Claudio: records what Claude desktop and Codex say out loud (Read aloud) into
+// clips you can scrub, save and share. Capture runs in capture.py (WASAPI process
+// loopback), one per app; Claude's buttons are driven by claude-control.ps1 (UI Automation).
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, dialog, shell, screen } = require('electron');
 const { spawn, execFile } = require('child_process');
 const fs = require('fs');
@@ -11,6 +11,17 @@ const BLOCK = 960; // 20 ms of mono samples
 const START_RMS = 250; // int16 RMS that counts as sound
 const END_SILENCE_MS = 3000; // silence that ends a clip
 const MIN_SOUND_MS = 800; // shorter clips (chimes, clicks) are discarded
+
+// Apps Claudio listens to. Each is matched by process name and install folder, and
+// recorded on its own. Codex hides its page from UI Automation, so it is record-only.
+const APPS = [
+  { name: 'Claude', exe: 'claude.exe', path: '*\\WindowsApps\\Claude_*' },
+  // The Codex desktop app (ChatGPT.exe; installed as OpenAI.Codex, older installs as OpenAI.ChatGPT).
+  // Its notification chime is 1.4 s long.
+  { name: 'Codex', exe: 'ChatGPT.exe', path: '*\\WindowsApps\\OpenAI.*', minSoundMs: 2500 },
+];
+const FULL_SIZE = { width: 380, height: 560 };
+const COMPACT_SIZE = { width: 380, height: 132 };
 const KEEP_TAIL_MS = 500;
 const PREROLL_BLOCKS = 10;
 
@@ -20,19 +31,24 @@ app.disableHardwareAcceleration();
 
 const clipsDir = path.join(app.getPath('userData'), 'clips');
 const indexFile = path.join(clipsDir, 'index.json');
+const settingsFile = path.join(app.getPath('userData'), 'settings.json');
 fs.mkdirSync(clipsDir, { recursive: true });
+
+// listen: "Listen in Claudio" (the apps play quietly, Claudio plays the audio).
+// compact: the small window with only the player.
+// updates: check GitHub once a day for a newer release (off until the user turns it on).
+let settings = { listen: false, compact: false, updates: false };
+try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsFile, 'utf8')) }; } catch {}
+function saveSettings() { fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2)); }
 
 let win = null;
 let tray = null;
-let capture = null;
-let capturePid = null;
 let clips = loadIndex();
-let cur = null; // clip being recorded
-let carry = Buffer.alloc(0);
-let preroll = [];
+// Per app: { name, pid, capture, carry, preroll, cur (clip being recorded), state }
+const sources = APPS.map((a) => ({ ...a, pid: null, capture: null, carry: Buffer.alloc(0), preroll: [], cur: null, state: 'waiting' }));
 let lastWindowTitle = null; // window we last asked to read
 let lastThread = null; // its thread name and reply, for naming the next clip
-let claudeHeld = false; // we paused Claude, so silence should not end the clip
+let claudeHeld = false; // we paused Claude, so silence should not end its clip
 
 function loadIndex() {
   let list;
@@ -40,6 +56,7 @@ function loadIndex() {
   // Older clips were saved as <id>.wav; give them readable names once.
   let changed = false;
   for (const m of list) {
+    if (m.app === 'ChatGPT') { m.app = 'Codex'; changed = true; } // briefly labelled ChatGPT
     if (m.file === `${m.id}.wav`) {
       const name = renameClipFile(m.file, clipFileName(m.title, m.startedAt));
       if (name !== m.file) { m.file = name; changed = true; }
@@ -75,11 +92,17 @@ function renameClipFile(from, to) {
 function saveIndex() { fs.writeFileSync(indexFile, JSON.stringify(clips, null, 2)); }
 function send(ch, data) { if (win && !win.isDestroyed()) win.webContents.send(ch, data); }
 function status(text) { send('status', text); }
+function showListening() {
+  const on = sources.filter((s) => s.state === 'on').map((s) => s.name);
+  status(on.length ? `Listening to ${on.join(' and ')}` : 'Waiting for Claude or Codex to start…');
+}
+function liveClips() { return sources.filter((s) => s.cur).map((s) => s.cur); }
 
 // ---------- capture ----------
-function findClaudePid() {
+function findPid(src) {
   return new Promise((resolve) => {
-    const ps = "$p=Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | ? { $_.ExecutablePath -like '*\\WindowsApps\\Claude_*' }; $ids=$p.ProcessId; ($p | ? { $ids -notcontains $_.ParentProcessId } | select -First 1).ProcessId";
+    // The app's root process: the one whose parent is not another copy of it.
+    const ps = `$p=Get-CimInstance Win32_Process -Filter "Name='${src.exe}'" | ? { $_.ExecutablePath -like '${src.path}' }; $ids=$p.ProcessId; ($p | ? { $ids -notcontains $_.ParentProcessId } | select -First 1).ProcessId`;
     execFile('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true }, (err, out) => {
       const pid = parseInt(String(out).trim(), 10);
       resolve(Number.isFinite(pid) ? pid : null);
@@ -87,30 +110,38 @@ function findClaudePid() {
   });
 }
 
-async function startCapture() {
-  const pid = await findClaudePid();
-  if (!pid) { status('Waiting for Claude to start…'); setTimeout(startCapture, 5000); return; }
-  capturePid = pid;
-  capture = spawn('python', ['-I', path.join(__dirname, 'capture.py'), String(pid)], { windowsHide: true });
-  capture.stdout.on('data', onPcm);
-  capture.stderr.on('data', (d) => console.log('[capture]', String(d).trim()));
-  capture.on('exit', (code) => {
-    capture = null;
-    finishClip(true);
-    status('Capture stopped, reconnecting…');
-    setTimeout(startCapture, 3000);
+async function startCapture(src) {
+  if (app.isQuitting) return;
+  const pid = await findPid(src);
+  if (!pid) { src.state = 'waiting'; showListening(); setTimeout(() => startCapture(src), 5000); return; }
+  src.pid = pid;
+  // detached: Node otherwise puts children in a job that Windows kills with Claudio,
+  // and capture.py must outlive a crash long enough to put the app's volume back.
+  // It still exits on its own when Claudio's end of stdin closes.
+  src.capture = spawn('python', ['-I', path.join(__dirname, 'capture.py'), String(pid)], { windowsHide: true, detached: true });
+  src.capture.stdout.on('data', (chunk) => onPcm(src, chunk));
+  src.capture.stderr.on('data', (d) => console.log(`[capture ${src.name}]`, String(d).trim()));
+  src.capture.stdin.on('error', () => {});
+  if (settings.listen) src.capture.stdin.write('quiet 1\n');
+  src.capture.on('exit', () => {
+    src.capture = null;
+    src.state = 'waiting';
+    finishClip(src);
+    showListening();
+    setTimeout(() => startCapture(src), 3000);
   });
-  status('Listening to Claude');
+  src.state = 'on';
+  showListening();
 }
 
-function onPcm(chunk) {
-  let buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+function onPcm(src, chunk) {
+  const buf = src.carry.length ? Buffer.concat([src.carry, chunk]) : chunk;
   const blockBytes = BLOCK * 2;
   let off = 0;
   for (; off + blockBytes <= buf.length; off += blockBytes) {
-    onBlock(Buffer.from(buf.subarray(off, off + blockBytes)));
+    onBlock(src, Buffer.from(buf.subarray(off, off + blockBytes)));
   }
-  carry = Buffer.from(buf.subarray(off));
+  src.carry = Buffer.from(buf.subarray(off));
 }
 
 function rms(block) {
@@ -119,68 +150,72 @@ function rms(block) {
   return Math.sqrt(s / (block.length / 2));
 }
 
-function onBlock(block) {
+function onBlock(src, block) {
   const loud = rms(block) > START_RMS;
   const now = Date.now();
+  const cur = src.cur;
   if (!cur) {
-    preroll.push(block);
-    if (preroll.length > PREROLL_BLOCKS) preroll.shift();
-    if (loud) startClip(now);
+    src.preroll.push(block);
+    if (src.preroll.length > PREROLL_BLOCKS) src.preroll.shift();
+    if (loud) startClip(src, now);
     return;
   }
   if (loud) {
     cur.lastLoud = now;
     cur.soundBlocks++;
-    for (const b of cur.pending) writeBlock(b); // silence inside speech is kept
+    for (const b of cur.pending) writeBlock(cur, b); // silence inside speech is kept
     cur.pending = [];
-    writeBlock(block);
+    writeBlock(cur, block);
   } else {
     cur.pending.push(block);
-    if (!claudeHeld && now - cur.lastLoud > END_SILENCE_MS) finishClip(false);
+    const held = src.name === 'Claude' && claudeHeld;
+    if (!held && now - cur.lastLoud > END_SILENCE_MS) finishClip(src);
   }
 }
 
-function startClip(now) {
-  const id = new Date(now).toISOString().replace(/[:.]/g, '-');
-  // Recorded under a temporary name; renamed to "<thread> <date time>.wav" when it finishes.
+function startClip(src, now) {
+  const id = `${new Date(now).toISOString().replace(/[:.]/g, '-')}-${src.name.toLowerCase()}`;
+  // Recorded under a temporary name; renamed to "<title> <date time>.wav" when it finishes.
   const file = path.join(clipsDir, `${id}.recording.wav`);
   const fd = fs.openSync(file, 'w');
   fs.writeSync(fd, wavHeader(0));
-  cur = { id, file, fd, samples: 0, startedAt: now, lastLoud: now, soundBlocks: 0, pending: [],
-          title: lastThread || lastWindowTitle || 'Claude audio' };
-  send('clip-start', { id, title: cur.title, startedAt: now, live: true });
-  for (const b of preroll) writeBlock(b);
-  preroll = [];
-  // Name the clip after the window that is reading, if we can tell.
+  const title = src.name === 'Claude' ? (lastThread || lastWindowTitle || 'Claude audio') : `${src.name} audio`;
+  const cur = src.cur = { id, app: src.name, file, fd, samples: 0, startedAt: now, lastLoud: now, soundBlocks: 0, pending: [], title };
+  send('clip-start', { id, app: src.name, title, startedAt: now, live: true });
+  for (const b of src.preroll) writeBlock(cur, b);
+  src.preroll = [];
+  if (src.name !== 'Claude') return;
+  // Name the clip after the Claude thread and reply that is reading, if we can tell.
   control('windows').then((r) => {
-    const playing = r && r.ok && r.windows.find((w) => w.state === 'playing');
-    const title = playing && clipTitle(playing.thread || playing.title, playing.reply);
-    if (title && cur && cur.id === id) { cur.title = title; send('clip-title', { id, title }); }
+    // Just after a press, Claude can still report the old state, so "paused" counts too.
+    const playing = r && r.ok && (r.windows.find((w) => w.state === 'playing') || r.windows.find((w) => w.state === 'paused'));
+    const t = playing && clipTitle(playing.thread || playing.title, playing.reply);
+    if (t && src.cur === cur) { cur.title = t; send('clip-title', { id, title: t }); }
   });
 }
 
-function writeBlock(b) {
+function writeBlock(cur, b) {
   fs.writeSync(cur.fd, b);
   cur.samples += b.length / 2;
   send('clip-data', { id: cur.id, pcm: b });
 }
 
-function finishClip(force) {
-  if (!cur) return;
-  const c = cur;
-  cur = null;
+function finishClip(src) {
+  const c = src.cur;
+  if (!c) return;
+  src.cur = null;
   const tail = Math.floor((KEEP_TAIL_MS / 1000) * RATE / BLOCK);
-  for (const b of c.pending.slice(0, tail)) { fs.writeSync(c.fd, b); c.samples += b.length / 2; send('clip-data', { id: c.id, pcm: b }); }
+  for (const b of c.pending.slice(0, tail)) writeBlock(c, b);
   const header = wavHeader(c.samples * 2);
   fs.writeSync(c.fd, header, 0, header.length, 0);
   fs.closeSync(c.fd);
-  if (c.soundBlocks * BLOCK / RATE * 1000 < MIN_SOUND_MS) {
+  if (c.soundBlocks * BLOCK / RATE * 1000 < (src.minSoundMs || MIN_SOUND_MS)) {
     fs.rmSync(c.file, { force: true });
     send('clip-discard', { id: c.id });
     return;
   }
   const file = renameClipFile(path.basename(c.file), clipFileName(c.title, c.startedAt));
-  const meta = { id: c.id, title: c.title, startedAt: c.startedAt, duration: c.samples / RATE, file };
+  const meta = { id: c.id, app: c.app, title: c.title, startedAt: c.startedAt, duration: c.samples / RATE, file };
   clips.unshift(meta);
   saveIndex();
   send('clip-end', meta);
@@ -212,6 +247,7 @@ ipcMain.handle('claude', async (_e, action, windowTitle) => {
   const r = await control(action, windowTitle);
   if (r.ok && action === 'read') {
     lastThread = clipTitle(r.thread || r.window, r.reply);
+    const cur = sources[0].cur;
     if (cur && lastThread && cur.title === 'Claude audio') { cur.title = lastThread; send('clip-title', { id: cur.id, title: lastThread }); }
   }
   if (r.ok && action === 'toggle') claudeHeld = r.did === 'Pause';
@@ -220,9 +256,9 @@ ipcMain.handle('claude', async (_e, action, windowTitle) => {
 });
 
 // ---------- clips ----------
-ipcMain.handle('clips', () => ({ clips, live: cur ? { id: cur.id, title: cur.title, startedAt: cur.startedAt } : null }));
+ipcMain.handle('clips', () => ({ clips, live: liveClips().map((c) => ({ id: c.id, app: c.app, title: c.title, startedAt: c.startedAt })) }));
 ipcMain.handle('clip-pcm', (_e, id) => {
-  if (cur && cur.id === id) return null; // live clip streams in instead
+  if (liveClips().some((c) => c.id === id)) return null; // live clips stream in instead
   const meta = clips.find((c) => c.id === id);
   if (!meta) return null;
   return fs.readFileSync(path.join(clipsDir, meta.file)).subarray(44);
@@ -259,6 +295,82 @@ ipcMain.handle('delete-clip', (_e, id) => {
   saveIndex();
 });
 ipcMain.on('hide', () => win && win.hide());
+ipcMain.handle('settings', () => settings);
+ipcMain.handle('set-listen', (_e, on) => {
+  settings.listen = !!on;
+  saveSettings();
+  for (const src of sources) if (src.capture) src.capture.stdin.write(`quiet ${on ? 1 : 0}\n`);
+  return settings;
+});
+ipcMain.handle('set-compact', (_e, on) => {
+  settings.compact = !!on;
+  saveSettings();
+  // Keep the window's bottom edge where it is, so it shrinks toward the corner.
+  const b = win.getBounds(), size = on ? COMPACT_SIZE : FULL_SIZE;
+  win.setBounds({ x: b.x, y: b.y + b.height - size.height, width: b.width, height: size.height });
+  return settings;
+});
+
+// ---------- updates (opt-in) ----------
+// When "Notify me of updates" is on, Claudio asks GitHub for the latest release once a
+// day. Nothing is sent except that request. Update = git pull + npm install + restart.
+const REPO = 'MrMalkio/claudio';
+const RELEASES = `https://github.com/${REPO}/releases`;
+let update = null; // { version, url } of a newer release
+let updateTimer = null;
+
+function newer(a, b) { // is version a newer than b?
+  const x = String(a).replace(/^v/, '').split('.').map(Number), y = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  return false;
+}
+
+async function checkUpdates() {
+  if (!settings.updates) return;
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`,
+      { headers: { 'User-Agent': 'Claudio', Accept: 'application/vnd.github+json' } });
+    if (!r.ok) return;
+    const rel = await r.json();
+    if (newer(rel.tag_name, app.getVersion())) {
+      update = { version: rel.tag_name.replace(/^v/, ''), url: rel.html_url };
+      send('update', update);
+    }
+  } catch {}
+}
+
+function setUpdates(on) {
+  settings.updates = !!on;
+  saveSettings();
+  clearInterval(updateTimer);
+  if (settings.updates) { checkUpdates(); updateTimer = setInterval(checkUpdates, 24 * 3600 * 1000); }
+  else { update = null; send('update', null); }
+  buildTrayMenu();
+}
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => execFile(cmd, args, { cwd: __dirname, windowsHide: true, timeout: 300000 },
+    (err, _out, errOut) => (err ? reject(new Error((errOut || err.message).trim().split(/\r?\n/)[0])) : resolve())));
+}
+
+ipcMain.handle('update-info', () => update);
+ipcMain.handle('run-update', async () => {
+  // A downloaded copy (no .git folder) can't pull: send the user to the release page.
+  if (!fs.existsSync(path.join(__dirname, '.git'))) { shell.openExternal(update?.url || RELEASES); return { ok: true, opened: true }; }
+  try {
+    send('update-status', 'Downloading the update…');
+    await run('git', ['pull', '--ff-only']);
+    send('update-status', 'Installing…');
+    await run('cmd.exe', ['/d', '/c', 'npm', 'install', '--no-audit', '--no-fund']);
+    send('update-status', 'Restarting…');
+    app.relaunch();
+    app.quit();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `Update failed: ${e.message}` };
+  }
+});
+ipcMain.on('open-release', () => shell.openExternal(update?.url || RELEASES));
 
 // ---------- window + tray ----------
 function trayIcon() {
@@ -279,8 +391,10 @@ function trayIcon() {
 
 function createWindow() {
   const { workArea } = screen.getPrimaryDisplay();
+  const size = settings.compact ? COMPACT_SIZE : FULL_SIZE;
   win = new BrowserWindow({
-    width: 380, height: 560, x: workArea.x + workArea.width - 400, y: workArea.y + workArea.height - 580,
+    ...size, x: workArea.x + workArea.width - size.width - 20, y: workArea.y + workArea.height - size.height - 20,
+    minWidth: 300, minHeight: COMPACT_SIZE.height,
     frame: false, resizable: true, alwaysOnTop: true, skipTaskbar: true, show: false,
     backgroundColor: '#16171d', title: 'Claudio', icon: trayIcon(),
     webPreferences: { preload: path.join(__dirname, 'preload.js') },
@@ -292,6 +406,19 @@ function createWindow() {
   win.on('close', (e) => { if (!app.isQuitting) { e.preventDefault(); win.hide(); } });
 }
 
+function buildTrayMenu() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show / hide', click: toggleWindow },
+    { label: 'Open clips folder', click: () => shell.openPath(clipsDir) },
+    { type: 'separator' },
+    { label: 'Notify me of updates', type: 'checkbox', checked: settings.updates, click: (m) => setUpdates(m.checked) },
+    { label: `Version ${app.getVersion()}`, enabled: false },
+    { type: 'separator' },
+    { label: 'Quit Claudio', click: () => { app.isQuitting = true; app.quit(); } },
+  ]));
+}
+
 function toggleWindow() {
   if (win.isVisible()) win.hide(); else { win.show(); win.focus(); }
 }
@@ -301,13 +428,9 @@ app.whenReady().then(() => {
   tray = new Tray(trayIcon());
   tray.setToolTip('Claudio');
   tray.on('click', toggleWindow);
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Show / hide', click: toggleWindow },
-    { label: 'Open clips folder', click: () => shell.openPath(clipsDir) },
-    { type: 'separator' },
-    { label: 'Quit Claudio', click: () => { app.isQuitting = true; app.quit(); } },
-  ]));
-  startCapture();
+  buildTrayMenu();
+  setUpdates(settings.updates);
+  for (const src of sources) startCapture(src);
   // Dev aid: CLAUDIO_SNAPSHOT=<file.png> saves a picture of the window after it settles.
   if (process.env.CLAUDIO_SNAPSHOT) {
     setTimeout(() => win.webContents.executeJavaScript("document.querySelector('.clip')?.click()"), 4000);
@@ -315,9 +438,16 @@ app.whenReady().then(() => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
   app.isQuitting = true;
-  finishClip(true);
-  if (capture) capture.stdin.end();
+  const running = sources.filter((s) => s.capture);
+  for (const src of sources) finishClip(src);
+  if (!running.length) return;
+  // Let each capture put its app's volume back before Claudio goes.
+  e.preventDefault();
+  let left = running.length;
+  const done = () => { if (--left === 0) app.exit(0); };
+  for (const src of running) { src.capture.once('exit', done); src.capture.stdin.end(); src.capture = null; }
+  setTimeout(() => app.exit(0), 3000);
 });
 app.on('window-all-closed', (e) => e.preventDefault());
