@@ -359,6 +359,8 @@ ipcMain.handle('run-update', async () => {
   if (!fs.existsSync(path.join(__dirname, '.git'))) { shell.openExternal(update?.url || RELEASES); return { ok: true, opened: true }; }
   try {
     send('update-status', 'Downloading the update…');
+    // npm can rewrite the lockfile on install; drop that so the pull isn't blocked by it.
+    await run('git', ['checkout', '--', 'package-lock.json']);
     await run('git', ['pull', '--ff-only']);
     send('update-status', 'Installing…');
     await run('cmd.exe', ['/d', '/c', 'npm', 'install', '--no-audit', '--no-fund']);
