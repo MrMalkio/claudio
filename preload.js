@@ -12,5 +12,8 @@ contextBridge.exposeInMainWorld('claudio', {
   settings: () => ipcRenderer.invoke('settings'),
   setListen: (on) => ipcRenderer.invoke('set-listen', on),
   setCompact: (on) => ipcRenderer.invoke('set-compact', on),
+  updateInfo: () => ipcRenderer.invoke('update-info'),
+  runUpdate: () => ipcRenderer.invoke('run-update'),
+  openRelease: () => ipcRenderer.send('open-release'),
   on: (channel, fn) => ipcRenderer.on(channel, (_e, data) => fn(data)),
 });

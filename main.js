@@ -36,7 +36,8 @@ fs.mkdirSync(clipsDir, { recursive: true });
 
 // listen: "Listen in Claudio" (the apps play quietly, Claudio plays the audio).
 // compact: the small window with only the player.
-let settings = { listen: false, compact: false };
+// updates: check GitHub once a day for a newer release (off until the user turns it on).
+let settings = { listen: false, compact: false, updates: false };
 try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsFile, 'utf8')) }; } catch {}
 function saveSettings() { fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2)); }
 
@@ -310,6 +311,67 @@ ipcMain.handle('set-compact', (_e, on) => {
   return settings;
 });
 
+// ---------- updates (opt-in) ----------
+// When "Notify me of updates" is on, Claudio asks GitHub for the latest release once a
+// day. Nothing is sent except that request. Update = git pull + npm install + restart.
+const REPO = 'MrMalkio/claudio';
+const RELEASES = `https://github.com/${REPO}/releases`;
+let update = null; // { version, url } of a newer release
+let updateTimer = null;
+
+function newer(a, b) { // is version a newer than b?
+  const x = String(a).replace(/^v/, '').split('.').map(Number), y = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  return false;
+}
+
+async function checkUpdates() {
+  if (!settings.updates) return;
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`,
+      { headers: { 'User-Agent': 'Claudio', Accept: 'application/vnd.github+json' } });
+    if (!r.ok) return;
+    const rel = await r.json();
+    if (newer(rel.tag_name, app.getVersion())) {
+      update = { version: rel.tag_name.replace(/^v/, ''), url: rel.html_url };
+      send('update', update);
+    }
+  } catch {}
+}
+
+function setUpdates(on) {
+  settings.updates = !!on;
+  saveSettings();
+  clearInterval(updateTimer);
+  if (settings.updates) { checkUpdates(); updateTimer = setInterval(checkUpdates, 24 * 3600 * 1000); }
+  else { update = null; send('update', null); }
+  buildTrayMenu();
+}
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => execFile(cmd, args, { cwd: __dirname, windowsHide: true, timeout: 300000 },
+    (err, _out, errOut) => (err ? reject(new Error((errOut || err.message).trim().split(/\r?\n/)[0])) : resolve())));
+}
+
+ipcMain.handle('update-info', () => update);
+ipcMain.handle('run-update', async () => {
+  // A downloaded copy (no .git folder) can't pull: send the user to the release page.
+  if (!fs.existsSync(path.join(__dirname, '.git'))) { shell.openExternal(update?.url || RELEASES); return { ok: true, opened: true }; }
+  try {
+    send('update-status', 'Downloading the update…');
+    await run('git', ['pull', '--ff-only']);
+    send('update-status', 'Installing…');
+    await run('cmd.exe', ['/d', '/c', 'npm', 'install', '--no-audit', '--no-fund']);
+    send('update-status', 'Restarting…');
+    app.relaunch();
+    app.quit();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `Update failed: ${e.message}` };
+  }
+});
+ipcMain.on('open-release', () => shell.openExternal(update?.url || RELEASES));
+
 // ---------- window + tray ----------
 function trayIcon() {
   const size = 32;
@@ -344,6 +406,19 @@ function createWindow() {
   win.on('close', (e) => { if (!app.isQuitting) { e.preventDefault(); win.hide(); } });
 }
 
+function buildTrayMenu() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show / hide', click: toggleWindow },
+    { label: 'Open clips folder', click: () => shell.openPath(clipsDir) },
+    { type: 'separator' },
+    { label: 'Notify me of updates', type: 'checkbox', checked: settings.updates, click: (m) => setUpdates(m.checked) },
+    { label: `Version ${app.getVersion()}`, enabled: false },
+    { type: 'separator' },
+    { label: 'Quit Claudio', click: () => { app.isQuitting = true; app.quit(); } },
+  ]));
+}
+
 function toggleWindow() {
   if (win.isVisible()) win.hide(); else { win.show(); win.focus(); }
 }
@@ -353,12 +428,8 @@ app.whenReady().then(() => {
   tray = new Tray(trayIcon());
   tray.setToolTip('Claudio');
   tray.on('click', toggleWindow);
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Show / hide', click: toggleWindow },
-    { label: 'Open clips folder', click: () => shell.openPath(clipsDir) },
-    { type: 'separator' },
-    { label: 'Quit Claudio', click: () => { app.isQuitting = true; app.quit(); } },
-  ]));
+  buildTrayMenu();
+  setUpdates(settings.updates);
   for (const src of sources) startCapture(src);
   // Dev aid: CLAUDIO_SNAPSHOT=<file.png> saves a picture of the window after it settles.
   if (process.env.CLAUDIO_SNAPSHOT) {

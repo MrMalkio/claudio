@@ -56,6 +56,14 @@
   body.compact .controls { justify-content: space-between; align-items: center; margin-top: 6px; }
   body.compact .controls .ct { display: inline; }
   .controls .ct { display: none; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 40px; }
+  #update { display: none; align-items: center; gap: 6px; padding: 6px 10px; background: #22305a; border-bottom: 1px solid var(--line); font-size: 12px; }
+  #update.show { display: flex; }
+  #ubtn { display: none; color: #9fb4ff; }
+  /* Compact has no room for the bar: a small button in the title bar instead. */
+  body.compact #update.show { display: none; }
+  body.compact.has-update #ubtn { display: inline-block; }
+  #update span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #update button { padding: 2px 8px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -64,8 +72,16 @@
     <span id="status">Starting…</span>
     <span id="ctitle">No clip selected</span>
     <button class="icon toggle" id="listen" title="Listen in Claudio: Claude and Codex play silently in the background and you hear them here. Pausing here doesn't stop the recording.">🎧</button>
+    <button class="icon" id="ubtn" title="Update available: click to update">⬆</button>
     <button class="icon" id="mode" title="Compact view">▭</button>
     <button class="icon" id="hide" title="Hide to tray">–</button>
+  </div>
+
+  <div id="update">
+    <span id="utext"></span>
+    <button class="primary" id="ugo">Update</button>
+    <button id="unotes" title="What's new">Notes</button>
+    <button class="icon" id="ux" title="Not now">×</button>
   </div>
 
   <section id="claudeSec">
@@ -320,8 +336,34 @@ async function refreshWindows() {
 }
 $('refresh').onclick = refreshWindows;
 
+// ---------- update banner (only when "Notify me of updates" is on in the tray menu) ----------
+function showUpdate(u) {
+  $('update').classList.toggle('show', !!u);
+  document.body.classList.toggle('has-update', !!u);
+  if (u) { updateSay(`Claudio ${u.version} is out.`, '⬆'); $('ugo').disabled = false; }
+}
+// The bar's text, and in compact view the ⬆ button's tooltip and symbol.
+function updateSay(text, mark) {
+  $('utext').textContent = text; $('utext').title = text;
+  $('ubtn').title = mark === '⬆' ? `${text} Click to update.` : text;
+  $('ubtn').textContent = mark;
+}
+api.on('update', showUpdate);
+api.on('update-status', (t) => updateSay(t, '…'));
+$('ugo').onclick = async () => {
+  if ($('ugo').disabled) return;
+  $('ugo').disabled = true;
+  const r = await api.runUpdate();
+  if (r.opened) showUpdate(null);
+  else if (!r.ok) { updateSay(r.error, '!'); $('ugo').disabled = false; }
+};
+$('ubtn').onclick = () => $('ugo').click();
+$('unotes').onclick = () => api.openRelease();
+$('ux').onclick = () => showUpdate(null);
+
 (async () => {
   showSettings(await api.settings());
+  showUpdate(await api.updateInfo());
   const { clips, live } = await api.clips();
   clipsMeta = clips.slice();
   for (const l of live || []) { ensure(l.id, true); clipsMeta.unshift({ ...l, duration: 0 }); }

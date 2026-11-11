@@ -19,6 +19,16 @@ double-click Claudio (or type "Claudio" in Start).
 
 From a terminal you can also run `npm start`.
 
+**Updates:** two ways to hear about new versions, both opt-in.
+
+- On GitHub, click **Watch → Custom → Releases** on this repo. GitHub emails you
+  when a new version is released.
+- In Claudio, right-click the tray icon and tick **Notify me of updates**. Claudio
+  then asks GitHub for the latest release once a day (nothing else is sent). When
+  there is a newer one, a bar appears with **Update**, which runs `git pull` and
+  `npm install` in the Claudio folder and restarts. If you downloaded a ZIP
+  instead of cloning, Update opens the release page so you can download it.
+
 Clips live in `%APPDATA%\claudio\clips` (WAV, 48 kHz mono, plus `index.json`).
 Tray icon: click to show or hide; right-click for the clips folder and Quit.
 
@@ -68,7 +78,7 @@ Tray icon: click to show or hide; right-click for the clips folder and Quit.
 | Piece | Job |
 | --- | --- |
 | `capture.py` | Python + ctypes, calls `ActivateAudioInterfaceAsync` with `VAD\Process_Loopback` for one app's main process and its children, and streams 48 kHz mono PCM to stdout. On `quiet 1` / `quiet 0` (stdin) it sets the app's mixer volume for Listen in Claudio. |
-| `main.js` | Electron main: finds each app (the `APPS` list), runs one capture per app, cuts clips, writes WAVs, tray and window. |
+| `main.js` | Electron main: finds each app (the `APPS` list), runs one capture per app, cuts clips, writes WAVs, tray and window, and the opt-in update check. |
 | `index.html` | The window: player, waveform and clip list. Plays clips through Web Audio. |
 | `claude-control.ps1` | UI Automation: finds and presses Claude's Read aloud / Pause / Resume buttons. |
 
@@ -129,6 +139,13 @@ MVP records from the outside instead.
 - If Claudio crashes with Listen on, its recorders notice and put Claude and
   Codex back to their normal volume.
 - Speed control (1.25x, 1.5x) is not in yet.
+
+## Releasing
+
+`main` is what users run. After a merge to `main`, bump `version` in
+`package.json` (in the PR), then tag and publish a GitHub Release named
+`vX.Y.Z` with short notes. Watchers get an email and Claudio users with
+**Notify me of updates** on see the Update bar.
 
 ## License
 
