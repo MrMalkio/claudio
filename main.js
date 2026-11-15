@@ -29,25 +29,55 @@ const PREROLL_BLOCKS = 10;
 // and triggers a Windows Security popup. This window doesn't need the GPU.
 app.disableHardwareAcceleration();
 
-const clipsDir = path.join(app.getPath('userData'), 'clips');
-const indexFile = path.join(clipsDir, 'index.json');
+// CLAUDIO_PROFILE=<folder> runs a separate copy with its own settings and clips (for testing).
+if (process.env.CLAUDIO_PROFILE) app.setPath('userData', process.env.CLAUDIO_PROFILE);
+// One Claudio at a time: two copies would both record and overwrite each other's clip list.
+// After an update the new copy can start while the old one is still closing, so it waits a bit.
+let gotLock = app.requestSingleInstanceLock();
+if (!gotLock && process.argv.includes('--after-update')) {
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let i = 0; i < 40 && !gotLock; i++) { Atomics.wait(pause, 0, 0, 250); gotLock = app.requestSingleInstanceLock(); }
+}
+if (!gotLock) process.exit(0);
+app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
+
 const settingsFile = path.join(app.getPath('userData'), 'settings.json');
-fs.mkdirSync(clipsDir, { recursive: true });
+const logFile = path.join(app.getPath('userData'), 'claudio.log');
+function log(...parts) {
+  const line = `${new Date().toISOString()} ${parts.map((p) => (p instanceof Error ? p.stack : String(p))).join(' ')}\n`;
+  try { fs.appendFileSync(logFile, line); } catch {}
+  console.log(line.trim());
+}
+// A bug should be logged, not take Claudio (and the recording) down with an error box.
+process.on('uncaughtException', (e) => log('uncaught', e));
+process.on('unhandledRejection', (e) => log('unhandled', e));
 
 // listen: "Listen in Claudio" (the apps play quietly, Claudio plays the audio).
 // compact: the small window with only the player.
-// updates: check GitHub once a day for a newer release (off until the user turns it on).
-let settings = { listen: false, compact: false, updates: false };
+// updateMode: 'off' | 'notify' (show an Update bar) | 'auto' (install when nothing is recording).
+// clipsDir: where recordings go (default: <userData>\clips).
+let settings = { listen: false, compact: false, updateMode: 'off', clipsDir: null };
 try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsFile, 'utf8')) }; } catch {}
-function saveSettings() { fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2)); }
+if ('updates' in settings) { settings.updateMode = settings.updates ? 'notify' : 'off'; delete settings.updates; }
+function saveSettings() {
+  try { fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2)); } catch (e) { log('settings', e); }
+}
+
+const defaultClipsDir = path.join(app.getPath('userData'), 'clips');
+let clipsDir = settings.clipsDir || defaultClipsDir;
+try { fs.mkdirSync(clipsDir, { recursive: true }); } catch (e) { log('clips folder', e); clipsDir = defaultClipsDir; fs.mkdirSync(clipsDir, { recursive: true }); }
+let indexFile = path.join(clipsDir, 'index.json');
 
 let win = null;
 let tray = null;
 let clips = loadIndex();
+recoverClips();
 // Per app: { name, pid, capture, carry, preroll, cur (clip being recorded), state }
 const sources = APPS.map((a) => ({ ...a, pid: null, capture: null, carry: Buffer.alloc(0), preroll: [], cur: null, state: 'waiting' }));
 let lastWindowTitle = null; // window we last asked to read
 let lastThread = null; // its thread name and reply, for naming the next clip
+let lastSession = null; // its thread name alone
+let lastReadAt = 0; // when we asked; the name is only used for a clip starting soon after
 let claudeHeld = false; // we paused Claude, so silence should not end its clip
 
 function loadIndex() {
@@ -57,6 +87,7 @@ function loadIndex() {
   let changed = false;
   for (const m of list) {
     if (m.app === 'ChatGPT') { m.app = 'Codex'; changed = true; } // briefly labelled ChatGPT
+    if (!('session' in m)) { m.session = guessSession(m); changed = true; }
     if (m.file === `${m.id}.wav`) {
       const name = renameClipFile(m.file, clipFileName(m.title, m.startedAt));
       if (name !== m.file) { m.file = name; changed = true; }
@@ -75,6 +106,15 @@ function clipFileName(title, startedAt) {
   return `${safe} ${stamp}.wav`;
 }
 
+// Session (Claude thread) of an older clip, from its "<thread> - <reply>" title.
+function guessSession(m) {
+  if (m.app && m.app !== 'Claude') return null;
+  const t = String(m.title || '');
+  if (!t || /^Claude audio\b/.test(t)) return null;
+  const i = t.indexOf(' - ');
+  return (i > 0 ? t.slice(0, i) : t).trim() || null;
+}
+
 // Clip title: the thread, plus the start of the reply being read ("Thread - First words of the reply…").
 function clipTitle(thread, reply) {
   let r = String(reply || '').replace(/\s+/g, ' ').trim().replace(/[.:,;!?]+$/, '');
@@ -89,7 +129,54 @@ function renameClipFile(from, to) {
   for (let i = 2; fs.existsSync(path.join(clipsDir, name)); i++) name = to.replace(/\.wav$/, ` (${i}).wav`);
   try { fs.renameSync(path.join(clipsDir, from), path.join(clipsDir, name)); return name; } catch { return from; }
 }
-function saveIndex() { fs.writeFileSync(indexFile, JSON.stringify(clips, null, 2)); }
+// Written to a temp file and swapped in, so a crash mid-write can't leave a broken list.
+function saveIndex() {
+  try {
+    fs.writeFileSync(indexFile + '.tmp', JSON.stringify(clips, null, 2));
+    fs.renameSync(indexFile + '.tmp', indexFile);
+  } catch (e) { log('saveIndex', e); }
+}
+
+// Puts back recordings the list doesn't know about: ones cut short by a crash
+// (still "*.recording.wav") and finished files missing from index.json.
+function recoverClips() {
+  let names;
+  try { names = fs.readdirSync(clipsDir); } catch { return; }
+  const known = new Set(clips.map((c) => c.file));
+  let changed = false;
+  for (const name of names) {
+    if (!name.endsWith('.wav') || known.has(name)) continue;
+    const full = path.join(clipsDir, name);
+    let size;
+    try { size = fs.statSync(full).size; } catch { continue; }
+    if (size <= 44) { if (name.endsWith('.recording.wav')) fs.rmSync(full, { force: true }); continue; }
+    const samples = Math.floor((size - 44) / 2);
+    let meta;
+    const m = name.match(/^(\d{4}-\d\d-\d\dT\d\d)-(\d\d)-(\d\d)-(\d{3})Z-(\w+)\.recording\.wav$/);
+    if (m) {
+      // Cut short by a crash: the header still says 0 bytes, so fix it, then name it.
+      try {
+        const fd = fs.openSync(full, 'r+'); const h = wavHeader(samples * 2);
+        fs.writeSync(fd, h, 0, h.length, 0); fs.closeSync(fd);
+      } catch (e) { log('recover', name, e); continue; }
+      const startedAt = Date.parse(`${m[1]}:${m[2]}:${m[3]}.${m[4]}Z`);
+      const appName = APPS.find((a) => a.name.toLowerCase() === m[5])?.name || 'Claude';
+      const id = name.replace(/\.recording\.wav$/, '');
+      const title = `${appName} audio (recovered)`;
+      meta = { id, app: appName, title, startedAt, duration: samples / RATE, file: renameClipFile(name, clipFileName(title, startedAt)) };
+    } else {
+      const s = name.match(/^(.*) (\d{4})-(\d\d)-(\d\d) (\d\d)-(\d\d)-(\d\d)(?: \(\d+\))?\.wav$/);
+      const startedAt = s ? new Date(+s[2], s[3] - 1, +s[4], +s[5], +s[6], +s[7]).getTime() : fs.statSync(full).mtimeMs - samples / RATE * 1000;
+      const title = s ? s[1] : name.replace(/\.wav$/, '');
+      const appName = /^Codex\b/.test(title) ? 'Codex' : 'Claude';
+      meta = { id: `found-${startedAt}-${clips.length}`, app: appName, title, startedAt, duration: samples / RATE, file: name };
+    }
+    meta.session = guessSession(meta);
+    clips.push(meta); changed = true;
+    log('recovered', meta.file);
+  }
+  if (changed) { clips.sort((a, b) => b.startedAt - a.startedAt); saveIndex(); }
+}
 function send(ch, data) { if (win && !win.isDestroyed()) win.webContents.send(ch, data); }
 function status(text) { send('status', text); }
 function showListening() {
@@ -179,19 +266,50 @@ function startClip(src, now) {
   const file = path.join(clipsDir, `${id}.recording.wav`);
   const fd = fs.openSync(file, 'w');
   fs.writeSync(fd, wavHeader(0));
-  const title = src.name === 'Claude' ? (lastThread || lastWindowTitle || 'Claude audio') : `${src.name} audio`;
-  const cur = src.cur = { id, app: src.name, file, fd, samples: 0, startedAt: now, lastLoud: now, soundBlocks: 0, pending: [], title };
-  send('clip-start', { id, app: src.name, title, startedAt: now, live: true });
+  // A name from Claudio's own Read button belongs to the next clip only, not later reads started in Claude.
+  const fresh = src.name === 'Claude' && now - lastReadAt < 30000;
+  const named = fresh && !!lastThread;
+  const title = src.name === 'Claude' ? ((fresh && lastThread) || 'Claude audio') : `${src.name} audio`;
+  const session = fresh ? (lastSession || lastWindowTitle || null) : null;
+  if (src.name === 'Claude') lastReadAt = 0;
+  const cur = src.cur = { id, app: src.name, file, fd, samples: 0, startedAt: now, lastLoud: now, soundBlocks: 0, pending: [], title, session };
+  send('clip-start', { id, app: src.name, title, session, startedAt: now, live: true });
   for (const b of src.preroll) writeBlock(cur, b);
   src.preroll = [];
-  if (src.name !== 'Claude') return;
-  // Name the clip after the Claude thread and reply that is reading, if we can tell.
+  if (src.name === 'Claude' && !named) nameFromClaude(id, title, 0);
+}
+
+// Names a Claude clip after the thread and reply that is reading. Claude can take a
+// moment to show its Pause button, so this asks a few times. If the clip has already
+// finished, its file is renamed. A name the user typed in the meantime is kept.
+function nameFromClaude(id, generic, attempt) {
   control('windows').then((r) => {
     // Just after a press, Claude can still report the old state, so "paused" counts too.
     const playing = r && r.ok && (r.windows.find((w) => w.state === 'playing') || r.windows.find((w) => w.state === 'paused'));
     const t = playing && clipTitle(playing.thread || playing.title, playing.reply);
-    if (t && src.cur === cur) { cur.title = t; send('clip-title', { id, title: t }); }
+    if (!t) {
+      if (attempt < 4 && (liveClips().some((c) => c.id === id))) setTimeout(() => nameFromClaude(id, generic, attempt + 1), 2000);
+      else log('naming: no playing Claude window for', id);
+      return;
+    }
+    applyName(id, generic, t, playing.thread || playing.title);
   });
+}
+
+function applyName(id, generic, title, session) {
+  const live = liveClips().find((c) => c.id === id);
+  if (live) {
+    if (live.title === generic) live.title = title;
+    if (!live.session) live.session = session;
+  } else {
+    const meta = clips.find((c) => c.id === id);
+    if (!meta) return;
+    if (meta.title === generic) { meta.title = title; meta.file = renameClipFile(meta.file, clipFileName(title, meta.startedAt)); }
+    if (!meta.session) meta.session = session;
+    saveIndex();
+  }
+  const c = live || clips.find((x) => x.id === id);
+  send('clip-title', { id, title: c.title, session: c.session });
 }
 
 function writeBlock(cur, b) {
@@ -215,7 +333,7 @@ function finishClip(src) {
     return;
   }
   const file = renameClipFile(path.basename(c.file), clipFileName(c.title, c.startedAt));
-  const meta = { id: c.id, app: c.app, title: c.title, startedAt: c.startedAt, duration: c.samples / RATE, file };
+  const meta = { id: c.id, app: c.app, title: c.title, session: c.session || null, startedAt: c.startedAt, duration: c.samples / RATE, file };
   clips.unshift(meta);
   saveIndex();
   send('clip-end', meta);
@@ -243,12 +361,14 @@ function control(action, windowTitle) {
 }
 
 ipcMain.handle('claude', async (_e, action, windowTitle) => {
-  if (action === 'read') { lastWindowTitle = windowTitle || null; lastThread = null; }
+  if (action === 'read') { lastWindowTitle = windowTitle || null; lastThread = null; lastSession = null; lastReadAt = Date.now(); }
   const r = await control(action, windowTitle);
   if (r.ok && action === 'read') {
     lastThread = clipTitle(r.thread || r.window, r.reply);
+    lastSession = r.thread || r.window || null;
+    // The clip may have started before Claude answered.
     const cur = sources[0].cur;
-    if (cur && lastThread && cur.title === 'Claude audio') { cur.title = lastThread; send('clip-title', { id: cur.id, title: lastThread }); }
+    if (cur && lastThread && Date.now() - cur.startedAt < 30000) applyName(cur.id, 'Claude audio', lastThread, lastSession);
   }
   if (r.ok && action === 'toggle') claudeHeld = r.did === 'Pause';
   if (action === 'read') claudeHeld = false;
@@ -256,7 +376,14 @@ ipcMain.handle('claude', async (_e, action, windowTitle) => {
 });
 
 // ---------- clips ----------
-ipcMain.handle('clips', () => ({ clips, live: liveClips().map((c) => ({ id: c.id, app: c.app, title: c.title, startedAt: c.startedAt })) }));
+ipcMain.handle('clips', () => ({ clips, live: liveClips().map((c) => ({ id: c.id, app: c.app, title: c.title, session: c.session, startedAt: c.startedAt })) }));
+// Puts a clip under a session (Claude thread) in the list; an empty name means none.
+ipcMain.handle('set-session', (_e, id, session) => {
+  const c = liveClips().find((x) => x.id === id) || clips.find((x) => x.id === id);
+  if (!c) return;
+  c.session = String(session || '').trim() || null;
+  if (clips.includes(c)) saveIndex();
+});
 ipcMain.handle('clip-pcm', (_e, id) => {
   if (liveClips().some((c) => c.id === id)) return null; // live clips stream in instead
   const meta = clips.find((c) => c.id === id);
@@ -312,12 +439,13 @@ ipcMain.handle('set-compact', (_e, on) => {
 });
 
 // ---------- updates (opt-in) ----------
-// When "Notify me of updates" is on, Claudio asks GitHub for the latest release once a
-// day. Nothing is sent except that request. Update = git pull + npm install + restart.
+// updateMode 'notify' or 'auto': Claudio asks GitHub for the latest release when it starts
+// and once a day. Nothing is sent except that request. Updating = git pull + npm install + restart.
 const REPO = 'MrMalkio/claudio';
 const RELEASES = `https://github.com/${REPO}/releases`;
 let update = null; // { version, url } of a newer release
 let updateTimer = null;
+let updating = false;
 
 function newer(a, b) { // is version a newer than b?
   const x = String(a).replace(/^v/, '').split('.').map(Number), y = String(b).split('.').map(Number);
@@ -325,27 +453,37 @@ function newer(a, b) { // is version a newer than b?
   return false;
 }
 
-async function checkUpdates() {
-  if (!settings.updates) return;
+async function checkUpdates(force) {
+  if (settings.updateMode === 'off' && !force) return { ok: true, update: null };
   try {
     const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`,
       { headers: { 'User-Agent': 'Claudio', Accept: 'application/vnd.github+json' } });
-    if (!r.ok) return;
+    if (r.status === 404) return { ok: true, update: null };
+    if (!r.ok) return { ok: false, error: `GitHub answered ${r.status}` };
     const rel = await r.json();
-    if (newer(rel.tag_name, app.getVersion())) {
-      update = { version: rel.tag_name.replace(/^v/, ''), url: rel.html_url };
-      send('update', update);
-    }
-  } catch {}
+    update = newer(rel.tag_name, app.getVersion()) ? { version: rel.tag_name.replace(/^v/, ''), url: rel.html_url } : null;
+    send('update', update);
+    if (update && settings.updateMode === 'auto') autoUpdate();
+    return { ok: true, update };
+  } catch (e) {
+    return { ok: false, error: `Couldn't reach GitHub (${e.message})` };
+  }
 }
 
-function setUpdates(on) {
-  settings.updates = !!on;
+// Automatic updates wait until nothing is being recorded, so a reply is never cut off.
+function autoUpdate() {
+  if (updating || !update || settings.updateMode !== 'auto') return;
+  if (liveClips().length) { setTimeout(autoUpdate, 60000); return; }
+  runUpdate().then((r) => { if (!r.ok) send('update-status', r.error); });
+}
+
+function setUpdateMode(mode) {
+  settings.updateMode = ['off', 'notify', 'auto'].includes(mode) ? mode : 'off';
   saveSettings();
   clearInterval(updateTimer);
-  if (settings.updates) { checkUpdates(); updateTimer = setInterval(checkUpdates, 24 * 3600 * 1000); }
+  if (settings.updateMode !== 'off') { checkUpdates(); updateTimer = setInterval(checkUpdates, 24 * 3600 * 1000); }
   else { update = null; send('update', null); }
-  buildTrayMenu();
+  return settings;
 }
 
 function run(cmd, args) {
@@ -353,10 +491,11 @@ function run(cmd, args) {
     (err, _out, errOut) => (err ? reject(new Error((errOut || err.message).trim().split(/\r?\n/)[0])) : resolve())));
 }
 
-ipcMain.handle('update-info', () => update);
-ipcMain.handle('run-update', async () => {
+async function runUpdate() {
   // A downloaded copy (no .git folder) can't pull: send the user to the release page.
   if (!fs.existsSync(path.join(__dirname, '.git'))) { shell.openExternal(update?.url || RELEASES); return { ok: true, opened: true }; }
+  if (updating) return { ok: true };
+  updating = true;
   try {
     send('update-status', 'Downloading the update…');
     // npm can rewrite the lockfile on install; drop that so the pull isn't blocked by it.
@@ -364,15 +503,75 @@ ipcMain.handle('run-update', async () => {
     await run('git', ['pull', '--ff-only']);
     send('update-status', 'Installing…');
     await run('cmd.exe', ['/d', '/c', 'npm', 'install', '--no-audit', '--no-fund']);
-    send('update-status', 'Restarting…');
-    app.relaunch();
+    send('update-status', 'Restarting Claudio to finish the update…');
+    log('updated, restarting');
+    app.relaunch({ args: process.argv.slice(1).filter((a) => a !== '--after-update').concat('--after-update') });
+    app.isQuitting = true;
     app.quit();
     return { ok: true };
   } catch (e) {
+    updating = false;
+    log('update failed', e);
     return { ok: false, error: `Update failed: ${e.message}` };
   }
-});
+}
+
+ipcMain.handle('update-info', () => update);
+ipcMain.handle('run-update', () => runUpdate());
+ipcMain.handle('check-updates', () => checkUpdates(true));
+ipcMain.handle('set-update-mode', (_e, mode) => setUpdateMode(mode));
 ipcMain.on('open-release', () => shell.openExternal(update?.url || RELEASES));
+ipcMain.on('open-maker', () => shell.openExternal('https://malkio.com'));
+ipcMain.handle('app-info', () => ({ version: app.getVersion(), clipsDir, defaultClipsDir, git: fs.existsSync(path.join(__dirname, '.git')) }));
+
+// ---------- recordings folder ----------
+function moveFile(from, to) {
+  try { fs.renameSync(from, to); } catch (e) {
+    if (e.code !== 'EXDEV') throw e; // another drive: copy, then delete
+    fs.copyFileSync(from, to); fs.rmSync(from, { force: true });
+  }
+}
+
+// Moves every recording and the list to a new folder. If that folder already has
+// Claudio recordings (say, a synced folder used on another PC), the lists are merged.
+function moveClipsTo(dir) {
+  if (liveClips().length) return { ok: false, error: 'Wait until the current recording finishes, then try again.' };
+  if (path.resolve(dir) === path.resolve(clipsDir)) return { ok: true, clipsDir };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    let there = [];
+    try { there = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8')); } catch {}
+    const ids = new Set(there.map((c) => c.id));
+    for (const c of clips) {
+      let name = c.file;
+      for (let i = 2; fs.existsSync(path.join(dir, name)); i++) name = c.file.replace(/\.wav$/, ` (${i}).wav`);
+      if (fs.existsSync(path.join(clipsDir, c.file))) moveFile(path.join(clipsDir, c.file), path.join(dir, name));
+      c.file = name;
+      if (!ids.has(c.id)) there.push(c);
+    }
+    there.sort((a, b) => b.startedAt - a.startedAt);
+    const old = indexFile;
+    clips = there; clipsDir = dir; indexFile = path.join(dir, 'index.json');
+    saveIndex();
+    fs.rmSync(old, { force: true });
+    settings.clipsDir = path.resolve(dir) === path.resolve(defaultClipsDir) ? null : dir;
+    saveSettings();
+    log('recordings moved to', dir);
+    send('clips-reload');
+    return { ok: true, clipsDir };
+  } catch (e) {
+    log('move recordings', e);
+    return { ok: false, error: `Couldn't move the recordings: ${e.message}` };
+  }
+}
+
+ipcMain.handle('choose-clips-dir', async () => {
+  const r = await dialog.showOpenDialog(win, { title: 'Where should Claudio keep recordings?', defaultPath: clipsDir, properties: ['openDirectory', 'createDirectory'] });
+  if (r.canceled || !r.filePaths[0]) return { ok: true, clipsDir };
+  return moveClipsTo(r.filePaths[0]);
+});
+ipcMain.handle('reset-clips-dir', () => moveClipsTo(defaultClipsDir));
+ipcMain.on('open-clips-dir', () => shell.openPath(clipsDir));
 
 // ---------- window + tray ----------
 function trayIcon() {
@@ -406,6 +605,9 @@ function createWindow() {
   win.once('ready-to-show', () => win.show());
   win.webContents.on('console-message', (e) => { if (e.level === 'error' || e.level === 'warning') console.log('[ui]', e.message); });
   win.on('close', (e) => { if (!app.isQuitting) { e.preventDefault(); win.hide(); } });
+  // Links never open inside Claudio's window.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
 }
 
 function buildTrayMenu() {
@@ -414,7 +616,7 @@ function buildTrayMenu() {
     { label: 'Show / hide', click: toggleWindow },
     { label: 'Open clips folder', click: () => shell.openPath(clipsDir) },
     { type: 'separator' },
-    { label: 'Notify me of updates', type: 'checkbox', checked: settings.updates, click: (m) => setUpdates(m.checked) },
+    { label: 'Settings…', click: () => { win.show(); win.focus(); send('open-settings'); } },
     { label: `Version ${app.getVersion()}`, enabled: false },
     { type: 'separator' },
     { label: 'Quit Claudio', click: () => { app.isQuitting = true; app.quit(); } },
@@ -431,7 +633,7 @@ app.whenReady().then(() => {
   tray.setToolTip('Claudio');
   tray.on('click', toggleWindow);
   buildTrayMenu();
-  setUpdates(settings.updates);
+  setUpdateMode(settings.updateMode);
   for (const src of sources) startCapture(src);
   // Dev aid: CLAUDIO_SNAPSHOT=<file.png> saves a picture of the window after it settles.
   if (process.env.CLAUDIO_SNAPSHOT) {

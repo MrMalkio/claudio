@@ -64,6 +64,25 @@
   body.compact.has-update #ubtn { display: inline-block; }
   #update span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #update button { padding: 2px 8px; font-size: 12px; }
+  /* Settings panel: covers everything under the title bar. */
+  #settingsPanel { display: none; position: absolute; inset: 41px 0 0 0; background: var(--bg); z-index: 5; overflow-y: auto; padding: 4px 0; }
+  #settingsPanel.show { display: block; }
+  #settingsPanel section { border-bottom: 1px solid var(--line); }
+  #settingsPanel .opt { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
+  #settingsPanel .opt input { margin: 0; accent-color: var(--accent); }
+  #settingsPanel .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  #settingsPanel .path { font-size: 12px; word-break: break-all; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; margin-bottom: 6px; }
+  #settingsPanel .row button { flex: 0 0 auto; }
+  #settingsPanel a { color: var(--accent-2); text-decoration: none; } #settingsPanel a:hover { text-decoration: underline; }
+  body { position: relative; }
+  body.compact #gear { display: none; }
+  /* Clip list grouped by session. */
+  .group { display: flex; align-items: center; gap: 6px; padding: 7px 10px 3px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; cursor: pointer; user-select: none; }
+  .group:hover { color: var(--text); }
+  .group .gn { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .group .gc { font-variant-numeric: tabular-nums; }
+  .clip.in { padding-left: 20px; }
+  .clip input.sess { width: 100%; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--accent); border-radius: 4px; padding: 2px 6px; }
 </style>
 </head>
 <body>
@@ -73,6 +92,7 @@
     <span id="ctitle">No clip selected</span>
     <button class="icon toggle" id="listen" title="Listen in Claudio: Claude and Codex play silently in the background and you hear them here. Pausing here doesn't stop the recording.">🎧</button>
     <button class="icon" id="ubtn" title="Update available: click to update">⬆</button>
+    <button class="icon" id="gear" title="Settings">⚙</button>
     <button class="icon" id="mode" title="Compact view">▭</button>
     <button class="icon" id="hide" title="Hide to tray">–</button>
   </div>
@@ -82,6 +102,29 @@
     <button class="primary" id="ugo">Update</button>
     <button id="unotes" title="What's new">Notes</button>
     <button class="icon" id="ux" title="Not now">×</button>
+  </div>
+
+  <div id="settingsPanel">
+    <section>
+      <div class="label">Updates</div>
+      <label class="opt"><input type="radio" name="um" value="off"> Don't check for updates</label>
+      <label class="opt"><input type="radio" name="um" value="notify"> Tell me, and I'll click Update</label>
+      <label class="opt"><input type="radio" name="um" value="auto"> Update automatically (when nothing is recording)</label>
+      <div class="row" style="margin-top:6px"><button id="checkNow">Check now</button><span class="hint" id="uinfo" style="margin:0"></span></div>
+      <div class="hint">Claudio only asks GitHub for the latest version, once a day. You can also get release emails: Watch → Custom → Releases on GitHub.</div>
+    </section>
+    <section>
+      <div class="label">Recordings folder</div>
+      <div class="path" id="cdir"></div>
+      <div class="row"><button id="cdirChange">Change…</button><button id="cdirOpen">Open</button><button id="cdirReset">Use default</button></div>
+      <div class="hint" id="cdirHint">Changing it moves your existing recordings there too.</div>
+    </section>
+    <section style="border-bottom:0">
+      <div class="row">
+        <div style="flex:1;min-width:0"><div class="hint" id="ver" style="margin:0"></div><div class="hint" style="margin:2px 0 0">Made by <a href="#" id="maker">Malkio</a></div></div>
+        <button class="primary" id="setDone">Done</button>
+      </div>
+    </section>
   </div>
 
   <section id="claudeSec">
@@ -233,32 +276,67 @@ function ago(t) {
   const h = Math.round(m / 60); if (h < 24) return `${h} h ago`;
   return new Date(t).toLocaleDateString();
 }
+// Clips are grouped under their session (the Claude thread). Use ⇄ to move one.
+let collapsed = new Set();
+try { collapsed = new Set(JSON.parse(localStorage.getItem('collapsed') || '[]')); } catch {}
+function groupOf(m) { return m.session || (m.app === 'Codex' ? 'Codex (no session name)' : 'No session'); }
 function renderList() {
   const L = $('list'); L.innerHTML = '';
   if (!clipsMeta.length) { L.innerHTML = '<div class="empty">No recordings yet. Press Read aloud in Claude or Codex, or “Read latest reply” above.</div>'; return; }
-  for (const m of clipsMeta) {
-    const d = document.createElement('div');
-    d.className = 'clip' + (m.id === selId ? ' sel' : '');
-    const live = store.get(m.id)?.live;
-    d.innerHTML = `<div class="t"><div class="n"></div><div class="m">${m.app || 'Claude'} · ${live ? '<span class="live">● recording</span>' : `${ago(m.startedAt)} · ${fmt(m.duration)}`}</div></div>
-      <div class="acts">${live ? '' : '<button data-a="rename" title="Rename">✎</button><button data-a="reveal" title="Show file">📁</button><button data-a="del" title="Delete">🗑</button>'}</div>`;
-    d.querySelector('.n').textContent = m.title;
-    d.onclick = (e) => {
-      const a = e.target.dataset?.a;
-      if (a === 'rename') {
-        const n = d.querySelector('.n'); n.contentEditable = 'true'; n.focus();
-        document.getSelection().selectAllChildren(n);
-        const done = () => { n.contentEditable = 'false'; const t = n.textContent.trim(); if (t && t !== m.title) { m.title = t; api.renameClip(m.id, t); if (m.id === selId) setTitle(t); } renderList(); };
-        n.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') { ev.preventDefault(); n.blur(); } if (ev.key === 'Escape') { n.textContent = m.title; n.blur(); } };
-        n.onblur = done; return;
-      }
-      if (e.target.isContentEditable) return;
-      if (a === 'reveal') { api.revealClip(m.id); return; }
-      if (a === 'del') { if (confirm('Delete this recording?')) { api.deleteClip(m.id); clipsMeta = clipsMeta.filter((x) => x.id !== m.id); if (selId === m.id) { selId = null; setTitle('No clip selected'); draw(); } renderList(); } return; }
-      select(m.id);
-    };
-    L.appendChild(d);
+  const groups = new Map(); // newest clip first, so groups come out newest first too
+  for (const m of clipsMeta) { const g = groupOf(m); if (!groups.has(g)) groups.set(g, []); groups.get(g).push(m); }
+  const dl = document.createElement('datalist'); dl.id = 'sessions';
+  for (const g of groups.keys()) { const o = document.createElement('option'); o.value = g; dl.appendChild(o); }
+  L.appendChild(dl);
+  for (const [g, items] of groups) {
+    const h = document.createElement('div'); h.className = 'group';
+    const shut = collapsed.has(g) && !items.some((m) => m.id === selId || store.get(m.id)?.live);
+    h.innerHTML = '<span></span><span class="gn"></span><span class="gc"></span>';
+    h.children[0].textContent = shut ? '▸' : '▾'; h.children[1].textContent = g; h.children[2].textContent = items.length;
+    h.title = g;
+    h.onclick = () => { if (collapsed.has(g)) collapsed.delete(g); else collapsed.add(g); try { localStorage.setItem('collapsed', JSON.stringify([...collapsed])); } catch {} renderList(); };
+    L.appendChild(h);
+    if (!shut) for (const m of items) L.appendChild(clipRow(m));
   }
+}
+function clipRow(m) {
+  const d = document.createElement('div');
+  d.className = 'clip in' + (m.id === selId ? ' sel' : '');
+  const live = store.get(m.id)?.live;
+  d.innerHTML = `<div class="t"><div class="n"></div><div class="m">${m.app || 'Claude'} · ${live ? '<span class="live">● recording</span>' : `${ago(m.startedAt)} · ${fmt(m.duration)}`}</div></div>
+    <div class="acts"><button data-a="move" title="Move to another session">⇄</button>${live ? '' : '<button data-a="rename" title="Rename">✎</button><button data-a="reveal" title="Show file">📁</button><button data-a="del" title="Delete">🗑</button>'}</div>`;
+  d.querySelector('.n').textContent = m.title;
+  d.onclick = (e) => {
+    const a = e.target.dataset?.a;
+    if (a === 'move') {
+      const n = d.querySelector('.n'), inp = document.createElement('input');
+      inp.className = 'sess'; inp.setAttribute('list', 'sessions'); inp.placeholder = 'Session name (empty = none)';
+      inp.value = m.session || ''; n.replaceWith(inp); inp.focus(); inp.select();
+      let doneOnce = false;
+      const done = (save) => {
+        if (doneOnce) return; doneOnce = true;
+        const v = inp.value.trim() || null;
+        if (save && v !== (m.session || null)) { m.session = v; api.setSession(m.id, v); collapsed.delete(groupOf(m)); }
+        renderList();
+      };
+      inp.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') done(true); if (ev.key === 'Escape') done(false); };
+      inp.onblur = () => done(true);
+      inp.onclick = (ev) => ev.stopPropagation();
+      return;
+    }
+    if (a === 'rename') {
+      const n = d.querySelector('.n'); n.contentEditable = 'true'; n.focus();
+      document.getSelection().selectAllChildren(n);
+      const done = () => { n.contentEditable = 'false'; const t = n.textContent.trim(); if (t && t !== m.title) { m.title = t; api.renameClip(m.id, t); if (m.id === selId) setTitle(t); } renderList(); };
+      n.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') { ev.preventDefault(); n.blur(); } if (ev.key === 'Escape') { n.textContent = m.title; n.blur(); } };
+      n.onblur = done; return;
+    }
+    if (e.target.isContentEditable || e.target.tagName === 'INPUT') return;
+    if (a === 'reveal') { api.revealClip(m.id); return; }
+    if (a === 'del') { if (confirm('Delete this recording?')) { api.deleteClip(m.id); clipsMeta = clipsMeta.filter((x) => x.id !== m.id); if (selId === m.id) { selId = null; setTitle('No clip selected'); draw(); } renderList(); } return; }
+    select(m.id);
+  };
+  return d;
 }
 
 // ---------- events from main ----------
@@ -271,8 +349,8 @@ api.on('clip-start', (m) => {
   else if (!playing) { selId = null; select(m.id); }
   renderList();
 });
-api.on('clip-title', ({ id, title }) => {
-  const m = clipsMeta.find((x) => x.id === id); if (m) m.title = title;
+api.on('clip-title', ({ id, title, session }) => {
+  const m = clipsMeta.find((x) => x.id === id); if (m) { m.title = title; if (session !== undefined) m.session = session; }
   if (id === selId) setTitle(title); renderList();
 });
 api.on('clip-data', ({ id, pcm }) => {
@@ -335,6 +413,43 @@ async function refreshWindows() {
   $('status').textContent = r.ok ? `${(r.windows || []).length} Claude window(s) with replies` : r.error;
 }
 $('refresh').onclick = refreshWindows;
+
+// ---------- settings ----------
+async function openSettings() {
+  if (document.body.classList.contains('compact')) showSettings(await api.setCompact(false));
+  const s = await api.settings(), info = await api.appInfo();
+  for (const r of document.querySelectorAll('input[name=um]')) r.checked = r.value === s.updateMode;
+  $('cdir').textContent = info.clipsDir; $('cdirReset').disabled = info.clipsDir === info.defaultClipsDir;
+  $('ver').textContent = `Claudio ${info.version}` + (info.git ? '' : ' (downloaded copy: updates open the release page)');
+  $('uinfo').textContent = ''; $('cdirHint').textContent = 'Changing it moves your existing recordings there too.';
+  $('settingsPanel').classList.add('show');
+}
+$('gear').onclick = () => ($('settingsPanel').classList.contains('show') ? $('settingsPanel').classList.remove('show') : openSettings());
+$('setDone').onclick = () => $('settingsPanel').classList.remove('show');
+api.on('open-settings', openSettings);
+for (const r of document.querySelectorAll('input[name=um]')) r.onchange = () => api.setUpdateMode(r.value);
+$('checkNow').onclick = async () => {
+  $('uinfo').textContent = 'Checking…';
+  const r = await api.checkUpdates();
+  $('uinfo').textContent = !r.ok ? r.error : r.update ? `Claudio ${r.update.version} is available.` : "You're up to date.";
+  if (r.update) showUpdate(r.update);
+};
+async function showDir(r) {
+  if (!r.ok) { $('cdirHint').textContent = r.error; return; }
+  const info = await api.appInfo();
+  $('cdir').textContent = info.clipsDir; $('cdirReset').disabled = info.clipsDir === info.defaultClipsDir;
+  $('cdirHint').textContent = 'Recordings are kept here.';
+}
+$('cdirChange').onclick = async () => showDir(await api.chooseClipsDir());
+$('cdirReset').onclick = async () => showDir(await api.resetClipsDir());
+$('cdirOpen').onclick = () => api.openClipsDir();
+$('maker').onclick = (e) => { e.preventDefault(); api.openMaker(); };
+api.on('clips-reload', async () => {
+  const { clips, live } = await api.clips();
+  clipsMeta = clips.slice();
+  for (const l of live || []) clipsMeta.unshift({ ...l, duration: 0 });
+  renderList();
+});
 
 // ---------- update banner (only when "Notify me of updates" is on in the tray menu) ----------
 function showUpdate(u) {
