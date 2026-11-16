@@ -1,14 +1,15 @@
 {
   "name": "claudio",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Records Claude's Read aloud audio so you can scrub, save and share it.",
   "main": "main.js",
   "private": true,
   "scripts": {
+    "postinstall": "install-electron",
     "start": "electron ."
   },
   "devDependencies": {
-    "electron": "43.4.0"
+    "electron": "43.8.10"
   },
   "license": "MIT"
 }
