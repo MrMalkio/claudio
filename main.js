@@ -189,8 +189,9 @@ function liveClips() { return sources.filter((s) => s.cur).map((s) => s.cur); }
 function findPid(src) {
   return new Promise((resolve) => {
     // The app's root process: the one whose parent is not another copy of it.
-    const ps = `$p=Get-CimInstance Win32_Process -Filter "Name='${src.exe}'" | ? { $_.ExecutablePath -like '${src.path}' }; $ids=$p.ProcessId; ($p | ? { $ids -notcontains $_.ParentProcessId } | select -First 1).ProcessId`;
-    execFile('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true }, (err, out) => {
+    // capture.py looks it up (not PowerShell, which can hang and would stop all recording).
+    execFile('python', ['-I', path.join(__dirname, 'capture.py'), 'find', src.exe, src.path], { windowsHide: true, timeout: 15000 }, (err, out) => {
+      if (err) log(`finding ${src.name}:`, err.message.split('\n')[0]);
       const pid = parseInt(String(out).trim(), 10);
       resolve(Number.isFinite(pid) ? pid : null);
     });
@@ -349,13 +350,22 @@ function wavHeader(dataBytes) {
 }
 
 // ---------- Claude control ----------
+let controlDownUntil = 0; // PowerShell timed out: skip it until this time
 function control(action, windowTitle) {
+  const hung = "Windows PowerShell isn't answering, so Claudio can't press Claude's buttons. Recording still works: press Read aloud in Claude. Restarting Windows usually fixes PowerShell.";
+  // After a timeout, don't start more PowerShells for a while: each one would hang too.
+  if (Date.now() < controlDownUntil) return Promise.resolve({ ok: false, error: hung });
   return new Promise((resolve) => {
     const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'claude-control.ps1'), '-Action', action];
     if (windowTitle) args.push('-Window', windowTitle);
     execFile('powershell', args, { windowsHide: true, timeout: 20000 }, (err, out) => {
       try { resolve(JSON.parse(String(out).trim().split('\n').pop())); }
-      catch { resolve({ ok: false, error: err ? err.message : 'No answer from Claude control' }); }
+      catch {
+        if (err) log(`claude ${action}:`, err.killed ? 'no answer in 20 s' : err.message.split('\n')[0]);
+        // Killed by the timeout: PowerShell (which presses Claude's buttons) is hung on this PC.
+        if (err && err.killed) controlDownUntil = Date.now() + 120000;
+        resolve({ ok: false, error: err && err.killed ? hung : 'No answer from Claude. Try again.' });
+      }
     });
   });
 }
