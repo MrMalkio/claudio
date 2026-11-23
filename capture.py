@@ -160,6 +160,42 @@ class PROCESSENTRY32W(ctypes.Structure):
                 ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
 
 
+def find_root(exe, pattern):
+    """The pid of an app's root process: named `exe`, installed under a path matching
+    `pattern`, and not started by another copy of itself. None if it isn't running.
+    (Done here, not in PowerShell, so recording works even when PowerShell doesn't.)"""
+    import fnmatch
+    k32 = ctypes.WinDLL("kernel32")
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [wintypes.HANDLE, POINTER(PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, POINTER(wintypes.DWORD)]
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    named = {}
+    e = PROCESSENTRY32W()
+    e.dwSize = ctypes.sizeof(e)
+    ok = k32.Process32FirstW(snap, byref(e))
+    while ok:
+        if e.szExeFile.lower() == exe.lower():
+            named[e.th32ProcessID] = e.th32ParentProcessID
+        ok = k32.Process32NextW(snap, byref(e))
+    k32.CloseHandle(snap)
+    matching = {}
+    for pid, parent in named.items():
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            continue
+        buf, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+        got = k32.QueryFullProcessImageNameW(h, 0, buf, byref(size))
+        k32.CloseHandle(h)
+        if got and fnmatch.fnmatch(buf.value.lower(), pattern.lower()):
+            matching[pid] = parent
+    roots = sorted(p for p, parent in matching.items() if parent not in matching)
+    return roots[0] if roots else None
+
+
 def process_tree(root):
     k32 = ctypes.WinDLL("kernel32")
     k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
@@ -330,7 +366,10 @@ class Limiter:
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("usage: capture.py <pid>")
+        sys.exit("usage: capture.py <pid>  |  capture.py find <exe> <path pattern>")
+    if sys.argv[1] == "find":  # prints the app's root pid, or nothing
+        print(find_root(sys.argv[2], sys.argv[3]) or "")
+        return
     pid = int(sys.argv[1])
 
     client, cap, _handler = open_loopback(pid)

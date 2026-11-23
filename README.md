@@ -160,6 +160,10 @@ MVP records from the outside instead.
   while playing). It works on the default output device only.
 - If Claudio crashes with Listen on, its recorders notice and put Claude and
   Codex back to their normal volume.
+- Pressing Claude's buttons and naming clips use Windows PowerShell. If PowerShell
+  hangs on your PC, Claudio says so, keeps recording (clips are then named
+  "Claude audio"), and tries again two minutes later. Restarting Windows usually
+  fixes PowerShell.
 - Speed control (1.25x, 1.5x) is not in yet.
 
 ## Releasing
